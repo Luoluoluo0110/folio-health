@@ -1,0 +1,28 @@
+{
+  "resourceType": "Bundle",
+  "type": "collection",
+  "entry": [
+    {
+      "resource": {
+        "resourceType": "DiagnosticReport",
+        "id": "folio-sample-metabolic-panel",
+        "status": "final",
+        "code": { "text": "Metabolic panel" },
+        "effectiveDateTime": "2026-09-07T09:30:00Z",
+        "performer": [{ "display": "Sample hospital" }],
+        "conclusion": "Illustrative imported report. This file contains sample data only."
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Observation",
+        "id": "folio-sample-glucose",
+        "status": "final",
+        "code": { "text": "Fasting glucose" },
+        "effectiveDateTime": "2026-09-07T09:30:00Z",
+        "valueQuantity": { "value": 94, "unit": "mg/dL" },
+        "performer": [{ "display": "Sample hospital" }]
+      }
+    }
+  ]
+}
