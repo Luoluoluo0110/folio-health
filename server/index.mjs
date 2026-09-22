@@ -328,7 +328,15 @@ app.post("/api/records", auth, (req, res) => {
 app.put("/api/records/:id", auth, (req, res) => {
   const old = req.state.records.find((r) => r.id === req.params.id);
   if (!old) return fail(res, "Record not found.", 404);
-  const r = { ...recordInput(req.body), id: old.id, version: old.version + 1 };
+  // Keep server-owned fields such as externalId. recordInput() only returns the
+  // user-editable fields, and externalId is the key FHIR imports de-duplicate on,
+  // so rebuilding the record from the input alone silently breaks re-imports.
+  const r = {
+    ...old,
+    ...recordInput(req.body),
+    id: old.id,
+    version: old.version + 1,
+  };
   req.state.history.unshift({
     id: id(),
     timestamp: new Date().toISOString(),

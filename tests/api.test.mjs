@@ -239,6 +239,29 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
   };
   assert.equal((await call("/import", { cookie, body: fhir })).data.count, 1);
   assert.equal((await call("/import", { cookie, body: fhir })).data.count, 0);
+  const imported = (await call("/state", { cookie })).data.state.records.find(
+    (r) => r.externalId === "Observation/lab-1",
+  );
+  assert.ok(imported, "an imported record keeps its FHIR external id");
+  const editedImport = await call(`/records/${imported.id}`, {
+    cookie,
+    method: "PUT",
+    body: { ...lab, title: "Edited import", notes: "Edited after import" },
+  });
+  assert.equal(
+    editedImport.data.state.records.find((r) => r.id === imported.id)
+      .externalId,
+    "Observation/lab-1",
+    "editing a record preserves its external id",
+  );
+  assert.equal((await call("/import", { cookie, body: fhir })).data.count, 0);
+  assert.equal(
+    (await call("/state", { cookie })).data.state.records.filter(
+      (r) => r.externalId === "Observation/lab-1",
+    ).length,
+    1,
+    "editing an imported record does not cause a duplicate import",
+  );
   const archive = await call("/export", { cookie });
   assert.equal(archive.data.format, "folio-archive-v1");
   assert.ok(
