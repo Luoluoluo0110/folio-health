@@ -20,6 +20,7 @@ import {
   id,
   hash,
   types,
+  fhirEntryDate,
   initialState,
   audit,
   grantActive,
@@ -533,7 +534,11 @@ function doImport(req, res, bundle) {
       if (known.has(r.externalId)) return false;
       known.add(r.externalId);
       return true;
-    });
+    }),
+    // importFHIR() has already rejected anything that is not a Bundle with an
+    // entry array, so every entry here was either mapped or dropped. Counting the
+    // dropped ones covers both unhandled resource types and unusable dates.
+    skipped = bundle.entry.filter(({ resource: r }) => !fhirEntryDate(r)).length;
   req.state.records.push(...fresh);
   for (const r of fresh)
     req.state.history.unshift({
@@ -545,6 +550,7 @@ function doImport(req, res, bundle) {
     });
   changed(req, res, "Imported", `${fresh.length} hospital records`, {
     count: fresh.length,
+    skipped,
   });
 }
 app.post("/api/import", auth, (req, res) => doImport(req, res, req.body));
