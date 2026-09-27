@@ -70,9 +70,9 @@ Settings → Export downloads a readable JSON archive of health records, measure
 
 ## Validation
 
-The automated suite checks authentication, account separation, rejected cross-origin writes, record revision preservation, valid measurement input, scoped access, allergy locks, authorized note edits, expiry, revocation, FHIR deduplication, export, absent-provider behavior, passkey registration options, and absence of plaintext health-record content in SQLite and its WAL.
+The automated suite (`npm test`) checks API and model behavior including authentication, account separation, rejected cross-origin writes, record revision preservation, valid measurement input, scoped access, allergy locks, authorized note edits, expiry, revocation, FHIR deduplication, export, absent-provider behavior, passkey registration options, and absence of plaintext health-record content in SQLite and its WAL.
 
-Browser checks cover the demo dashboard, adding records, typo-tolerant search, and responsive layouts. Hardware passkey completion, paid SMS delivery, and a real hospital connection require their respective external devices or providers and were not end-to-end verified here.
+Browser behavior—including the demo dashboard, adding records, typo-tolerant search, responsive layouts, and production static serving—is not covered by an automated browser suite. Hardware passkey completion, paid SMS delivery, and a real hospital connection require their respective external devices or providers and were not end-to-end verified here.
 
 ## Before real-world deployment
 
