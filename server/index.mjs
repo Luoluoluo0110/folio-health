@@ -50,7 +50,7 @@ const decrypt = (value) => {
 };
 const db = new DatabaseSync(path.join(dir, "folio.sqlite"));
 db.exec(
-  "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT UNIQUE, password TEXT, salt TEXT, demo INTEGER, state TEXT); CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT, expires INTEGER); CREATE TABLE IF NOT EXISTS shares (token TEXT PRIMARY KEY, user_id TEXT, grant_id TEXT);",
+  "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT UNIQUE, password TEXT, salt TEXT, demo INTEGER, state TEXT); CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT, expires INTEGER); CREATE TABLE IF NOT EXISTS shares (token TEXT PRIMARY KEY, user_id TEXT, grant_id TEXT); CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, content TEXT NOT NULL); CREATE TABLE IF NOT EXISTS user_state_sections (user_id TEXT NOT NULL, section TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (user_id, section)); CREATE TABLE IF NOT EXISTS user_records (user_id TEXT NOT NULL, record_id TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (user_id, record_id)); CREATE INDEX IF NOT EXISTS user_records_user_idx ON user_records(user_id); CREATE TABLE IF NOT EXISTS access_logs (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, entry TEXT NOT NULL); CREATE INDEX IF NOT EXISTS access_logs_user_idx ON access_logs(user_id);",
 );
 const app = express();
 app.disable("x-powered-by");
@@ -76,11 +76,162 @@ app.use((req, res, next) => {
       .json({ error: "This request came from a different origin." });
   next();
 });
-const save = (uid, state) =>
-  db.prepare("UPDATE users SET state=? WHERE id=?").run(encrypt(state), uid);
+const save = (
+  uid,
+  state,
+  sections = Object.keys(state).filter((key) => key !== "logs"),
+  recordChanges = null,
+) => {
+  const upsert = db.prepare(
+    "INSERT INTO user_state_sections (user_id,section,value) VALUES (?,?,?) ON CONFLICT(user_id,section) DO UPDATE SET value=excluded.value",
+  );
+  for (const section of sections) {
+    if (section === "logs" || section === "records" || !(section in state)) continue;
+    upsert.run(uid, section, encrypt(state[section]));
+  }
+  if (!sections.includes("records")) return;
+  const writeRecord = db.prepare(
+    "INSERT INTO user_records (user_id,record_id,value) VALUES (?,?,?) ON CONFLICT(user_id,record_id) DO UPDATE SET value=excluded.value",
+  );
+  if (recordChanges) {
+    for (const record of recordChanges)
+      writeRecord.run(uid, record.id, encrypt(record));
+    return;
+  }
+  db.prepare("DELETE FROM user_records WHERE user_id=?").run(uid);
+  for (const record of state.records) writeRecord.run(uid, record.id, encrypt(record));
+};
+const attachmentMeta = (fileId, file) => ({
+  id: fileId,
+  name: file.name,
+  type: file.type || file.data?.match(/^data:([^;,]+)/)?.[1] || "application/octet-stream",
+  size: file.data
+    ? Buffer.from(file.data.slice(file.data.indexOf(",") + 1), "base64").length
+    : file.size || 0,
+});
+const migrateLegacyState = (uid, state) => {
+  const pending = [],
+    idsByData = new Map();
+  for (const record of state.records) {
+    if (record.file?.data) {
+      let fileId = idsByData.get(record.file.data);
+      if (!fileId) {
+        fileId = id();
+        idsByData.set(record.file.data, fileId);
+        pending.push({ id: fileId, content: record.file.data });
+      }
+      record.file = attachmentMeta(fileId, record.file);
+    }
+  }
+  const stripHistoryFiles = (value) => {
+    if (!value || typeof value !== "object") return value;
+    if (Array.isArray(value)) return value.map(stripHistoryFiles);
+    if (value.file?.data) {
+      const { data, ...metadata } = value.file;
+      value.file = metadata;
+    }
+    for (const child of Object.values(value)) stripHistoryFiles(child);
+    return value;
+  };
+  state.history = state.history.map(stripHistoryFiles);
+  state.logs = (state.logs || []).slice(0, 2000);
+  db.exec("BEGIN");
+  try {
+    const insertAttachment = db.prepare(
+      "INSERT INTO attachments (id,user_id,content) VALUES (?,?,?)",
+    );
+    for (const file of pending)
+      insertAttachment.run(file.id, uid, encrypt(file.content));
+    save(uid, state);
+    const insertLog = db.prepare(
+      "INSERT INTO access_logs (id,user_id,entry) VALUES (?,?,?)",
+    );
+    for (const entry of state.logs || [])
+      insertLog.run(entry.id, uid, encrypt(entry));
+    db.prepare("UPDATE users SET state='' WHERE id=?").run(uid);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+};
 const load = (uid) => {
   const u = db.prepare("SELECT * FROM users WHERE id=?").get(uid);
-  return u ? { ...u, state: decrypt(u.state) } : null;
+  if (!u) return null;
+  let state;
+  if (u.state) {
+    state = decrypt(u.state);
+    migrateLegacyState(uid, state);
+  } else {
+    const sectionRows = db
+      .prepare("SELECT section,value FROM user_state_sections WHERE user_id=?")
+      .all(uid);
+    state = Object.fromEntries(
+      sectionRows
+        .filter(({ section }) => section !== "records")
+        .map(({ section, value }) => [section, decrypt(value)]),
+    );
+    if (!state.profile) throw new Error("User state is unavailable.");
+    const legacyRecords = sectionRows.find(({ section }) => section === "records");
+    if (legacyRecords) {
+      const records = decrypt(legacyRecords.value);
+      db.exec("BEGIN");
+      try {
+        save(uid, { records }, ["records"]);
+        db.prepare(
+          "DELETE FROM user_state_sections WHERE user_id=? AND section='records'",
+        ).run(uid);
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    state.records = db
+      .prepare("SELECT value FROM user_records WHERE user_id=? ORDER BY rowid")
+      .all(uid)
+      .map(({ value }) => decrypt(value));
+    state.logs = db
+      .prepare(
+        "SELECT entry FROM access_logs WHERE user_id=? ORDER BY rowid DESC LIMIT 2000",
+      )
+      .all(uid)
+      .map(({ entry }) => decrypt(entry));
+  }
+  return { ...u, state };
+};
+const recordAudit = (state, uid, action, detail, actor = "You", location = "Local device") => {
+  audit(state, action, detail, actor, location);
+  state.logs = state.logs.slice(0, 2000);
+  if (uid && db.prepare("SELECT 1 FROM users WHERE id=?").get(uid)) {
+    const entry = state.logs[0];
+    db.prepare("INSERT INTO access_logs (id,user_id,entry) VALUES (?,?,?)").run(
+      entry.id,
+      uid,
+      encrypt(entry),
+    );
+    db.prepare(
+      "DELETE FROM access_logs WHERE user_id=? AND rowid NOT IN (SELECT rowid FROM access_logs WHERE user_id=? ORDER BY rowid DESC LIMIT 2000)",
+    ).run(uid, uid);
+  }
+};
+const pruneUnusedAttachments = (uid, state) => {
+  const referenced = new Set(
+    state.records.map((record) => record.file?.id).filter(Boolean),
+  );
+  const rows = db
+    .prepare("SELECT id FROM attachments WHERE user_id=?")
+    .all(uid);
+  const remove = db.prepare("DELETE FROM attachments WHERE id=? AND user_id=?");
+  for (const { id: fileId } of rows)
+    if (!referenced.has(fileId))
+      remove.run(fileId, uid);
+};
+const attachmentContent = (uid, fileId) => {
+  const row = db
+    .prepare("SELECT content FROM attachments WHERE id=? AND user_id=?")
+    .get(fileId, uid);
+  return row ? decrypt(row.content) : null;
 };
 const cookie = (req) =>
   req.headers.cookie
@@ -118,13 +269,76 @@ const safeState = (s) => ({
     ...g,
     active: grantActive(g),
   })),
-  records: [...s.records].sort((a, b) => b.date.localeCompare(a.date)),
+  records: [...s.records]
+    .sort((a, b) => b.date.localeCompare(a.date))
+    .map((record) => ({
+      ...record,
+      file: record.file
+        ? { ...record.file, url: `/api/attachments/${record.file.id}` }
+        : null,
+    })),
 });
-const changed = (req, res, action, detail, extra = {}) => {
-  audit(req.state, action, detail, "You", req.ip);
-  save(req.user.id, req.state);
-  res.json({ state: safeState(req.state), ...extra });
+const changed = (
+  req,
+  res,
+  action,
+  detail,
+  extra = {},
+  sections = [],
+  recordChanges = null,
+) => {
+  recordAudit(req.state, req.user.id, action, detail, "You", req.ip);
+  save(req.user.id, req.state, sections, recordChanges);
+  if (sections.includes("records")) pruneUnusedAttachments(req.user.id, req.state);
+  res.json({ ok: true, ...extra });
 };
+const addHistory = (state, entry, recordId) => {
+  state.history.unshift({ ...entry, ...(recordId ? { recordId } : {}) });
+  let retained = 0;
+  state.history = state.history.filter((item) => {
+    if (item.recordId !== recordId || !recordId) return true;
+    return ++retained <= 100;
+  }).slice(0, 2000);
+};
+const historyRecord = (record) => ({
+  ...record,
+  file: record.file && { ...record.file },
+});
+const storeAttachment = (uid, file) => {
+  if (!file) return null;
+  if (typeof file.data === "string") {
+    const fileId = id();
+    db.prepare("INSERT INTO attachments (id,user_id,content) VALUES (?,?,?)").run(
+      fileId,
+      uid,
+      encrypt(file.data),
+    );
+    return attachmentMeta(fileId, file);
+  }
+  const existing = file.id
+    ? db
+        .prepare("SELECT 1 FROM attachments WHERE id=? AND user_id=?")
+        .get(file.id, uid)
+    : null;
+  if (!existing)
+    throw new ClientError("Attachment is unavailable. Please upload it again.");
+  return { id: file.id, name: file.name, type: file.type, size: file.size };
+};
+const validateFile = (file) => {
+  if (
+    file &&
+    (typeof file.data !== "string" ||
+      !/^data:(application\/pdf|image\/(png|jpeg));base64,/.test(file.data) ||
+      file.data.length > 7500000)
+  )
+    throw new ClientError("Attach a PDF, PNG, or JPEG up to 5 MB.");
+};
+class ClientError extends Error {
+  constructor(message, status = 400) {
+    super(message);
+    this.status = status;
+  }
+}
 const fail = (res, message, status = 400) =>
   res.status(status).json({ error: message });
 const rate = new Map();
@@ -143,14 +357,27 @@ function createUser(email, password, name, demo = false) {
     state = initialState(demo, name);
   state.profile.email = email;
   audit(state, "Created", "Health workspace created");
-  db.prepare("INSERT INTO users VALUES (?,?,?,?,?,?)").run(
-    uid,
-    email,
-    scryptSync(password, salt, 64).toString("hex"),
-    salt,
-    demo ? 1 : 0,
-    encrypt(state),
-  );
+  db.exec("BEGIN");
+  try {
+    db.prepare("INSERT INTO users VALUES (?,?,?,?,?,?)").run(
+      uid,
+      email,
+      scryptSync(password, salt, 64).toString("hex"),
+      salt,
+      demo ? 1 : 0,
+      "",
+    );
+    save(uid, state);
+    db.prepare("INSERT INTO access_logs (id,user_id,entry) VALUES (?,?,?)").run(
+      state.logs[0].id,
+      uid,
+      encrypt(state.logs[0]),
+    );
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
   return uid;
 }
 app.post("/api/auth/demo", (req, res) => {
@@ -205,40 +432,38 @@ app.post("/api/auth/login", (req, res) => {
   );
   if (!u || !timingSafeEqual(candidate, Buffer.from(u.password, "hex"))) {
     if (u) {
-      const state = decrypt(u.state);
-      audit(
+      const state = load(u.id).state;
+      recordAudit(
         state,
+        u.id,
         "Denied",
         "Unsuccessful password sign-in",
         "Unverified visitor",
         req.ip,
       );
-      save(u.id, state);
     }
     return fail(res, "Email or password is incorrect.", 401);
   }
-  const s = decrypt(u.state);
-  audit(s, "Signed in", "Password authentication", "You", req.ip);
-  save(u.id, s);
+  const s = load(u.id).state;
+  recordAudit(s, u.id, "Signed in", "Password authentication", "You", req.ip);
   session(req, res, u.id);
   res.json({ ok: true });
 });
 app.post("/api/logout", auth, (req, res) => {
-  audit(req.state, "Signed out", "Session ended", "You", req.ip);
-  save(req.user.id, req.state);
+  recordAudit(req.state, req.user.id, "Signed out", "Session ended", "You", req.ip);
   db.prepare("DELETE FROM sessions WHERE token=?").run(hash(cookie(req)));
   res.clearCookie("folio_session", { path: "/" });
   res.json({ ok: true });
 });
 app.get("/api/state", auth, (req, res) => {
-  audit(
+  recordAudit(
     req.state,
+    req.user.id,
     "Viewed",
     "Health workspace and record index",
     "You",
     req.ip,
   );
-  save(req.user.id, req.state);
   res.json({
     state: safeState(req.state),
     demo: !!req.user.demo,
@@ -259,16 +484,36 @@ app.get("/api/state", auth, (req, res) => {
 app.put("/api/profile", auth, (req, res) => {
   const p = req.body,
     before = structuredClone(req.state.profile);
-  if (p.name !== undefined && (!p.name.trim() || p.name.length > 100))
+  if (!p || typeof p !== "object" || Array.isArray(p))
+    return fail(res, "Submit profile fields as a JSON object.");
+  if (
+    p.name !== undefined &&
+    (typeof p.name !== "string" || !p.name.trim() || p.name.length > 100)
+  )
     return fail(res, "Enter a name under 100 characters.");
-  if (p.phone && !/^\+[1-9]\d{7,14}$/.test(p.phone))
+  if (
+    p.dob !== undefined &&
+    (typeof p.dob !== "string" || (p.dob !== "" && !validDate(p.dob)))
+  )
+    return fail(res, "Enter a valid date of birth in YYYY-MM-DD format.");
+  if (
+    p.phone !== undefined &&
+    (typeof p.phone !== "string" ||
+      (p.phone !== "" && !/^\+[1-9]\d{7,14}$/.test(p.phone)))
+  )
     return fail(res, "Use an international phone number, starting with +.");
   for (const k of Object.keys(req.state.profile)) {
-    if (k === "email") continue;
-    if (typeof p[k] === "string" && p[k].length <= 4000)
-      req.state.profile[k] = p[k];
+    if (["email", "name", "dob", "phone"].includes(k) || p[k] === undefined)
+      continue;
+    if (typeof p[k] !== "string" || p[k].length > 4000)
+      return fail(res, "Profile fields must be text under 4,000 characters.");
   }
-  req.state.history.unshift({
+  for (const k of Object.keys(req.state.profile)) {
+    if (k === "email") continue;
+    if (p[k] === undefined) continue;
+    req.state.profile[k] = p[k];
+  }
+  addHistory(req.state, {
     id: id(),
     timestamp: new Date().toISOString(),
     title: "Personal profile",
@@ -276,7 +521,7 @@ app.put("/api/profile", auth, (req, res) => {
     detail: "Personal information updated",
     snapshot: structuredClone(req.state.profile),
   });
-  changed(req, res, "Edited", "Personal profile updated");
+  changed(req, res, "Edited", "Personal profile updated", {}, ["profile", "history"]);
 });
 const validDate = (d) =>
   typeof d === "string" &&
@@ -292,17 +537,10 @@ function recordInput(body) {
     typeof body.notes !== "string" ||
     body.notes.length > 20000
   )
-    throw new Error(
+    throw new ClientError(
       "Please enter a title, record type, valid date, and notes under 20,000 characters.",
     );
-  if (
-    body.file &&
-    (!/^data:(application\/pdf|image\/(png|jpeg));base64,/.test(
-      body.file.data,
-    ) ||
-      body.file.data.length > 7500000)
-  )
-    throw new Error("Attach a PDF, PNG, or JPEG up to 5 MB.");
+  validateFile(body.file?.data ? body.file : null);
   return {
     title: body.title.trim(),
     type: body.type,
@@ -314,16 +552,18 @@ function recordInput(body) {
   };
 }
 app.post("/api/records", auth, (req, res) => {
-  const r = { ...recordInput(req.body), id: id(), version: 1 };
+  const input = recordInput(req.body);
+  input.file = storeAttachment(req.user.id, input.file);
+  const r = { ...input, id: id(), version: 1 };
   req.state.records.push(r);
-  req.state.history.unshift({
+  addHistory(req.state, {
     id: id(),
     timestamp: new Date().toISOString(),
     title: r.title,
     detail: "Record created",
-    snapshot: r,
-  });
-  changed(req, res, "Added", r.title);
+    snapshot: historyRecord(r),
+  }, r.id);
+  changed(req, res, "Added", r.title, {}, ["records", "history"], [r]);
 });
 app.put("/api/records/:id", auth, (req, res) => {
   const old = req.state.records.find((r) => r.id === req.params.id);
@@ -331,27 +571,45 @@ app.put("/api/records/:id", auth, (req, res) => {
   // Keep server-owned fields such as externalId. recordInput() only returns the
   // user-editable fields, and externalId is the key FHIR imports de-duplicate on,
   // so rebuilding the record from the input alone silently breaks re-imports.
+  const input = recordInput(req.body);
+  input.file = input.file?.data
+    ? storeAttachment(req.user.id, input.file)
+    : input.file?.id
+      ? storeAttachment(req.user.id, input.file)
+      : null;
   const r = {
     ...old,
-    ...recordInput(req.body),
+    ...input,
     id: old.id,
     version: old.version + 1,
   };
-  req.state.history.unshift({
+  addHistory(req.state, {
     id: id(),
     timestamp: new Date().toISOString(),
     title: old.title,
     detail: `Version ${old.version} → ${r.version}`,
-    before: old,
-    snapshot: r,
-  });
+    before: historyRecord(old),
+    snapshot: historyRecord(r),
+  }, r.id);
   req.state.records = req.state.records.map((x) => (x.id === old.id ? r : x));
-  changed(req, res, "Edited", r.title);
+  changed(req, res, "Edited", r.title, {}, ["records", "history"], [r]);
 });
 app.post("/api/records/:id/view", auth, (req, res) => {
   const r = req.state.records.find((r) => r.id === req.params.id);
   if (!r) return fail(res, "Record not found.", 404);
-  changed(req, res, "Viewed", r.title);
+  changed(req, res, "Viewed", r.title, {}, []);
+});
+app.get("/api/attachments/:id", auth, (req, res) => {
+  const record = req.state.records.find((item) => item.file?.id === req.params.id);
+  if (!record) return fail(res, "Attachment not found.", 404);
+  const content = attachmentContent(req.user.id, req.params.id);
+  if (!content) return fail(res, "Attachment not found.", 404);
+  const match = /^data:(application\/pdf|image\/(?:png|jpeg));base64,(.+)$/.exec(content);
+  if (!match) return fail(res, "Attachment could not be read.", 404);
+  res
+    .type(match[1])
+    .attachment(record.file.name)
+    .send(Buffer.from(match[2], "base64"));
 });
 app.post("/api/metrics", auth, (req, res) => {
   const m = req.body;
@@ -380,7 +638,7 @@ app.post("/api/metrics", auth, (req, res) => {
     ),
   });
   req.state.metrics.sort((a, b) => a.date.localeCompare(b.date));
-  changed(req, res, "Added", "Health measurements");
+  changed(req, res, "Added", "Health measurements", {}, ["metrics"]);
 });
 app.put("/api/targets", auth, (req, res) => {
   for (const k of ["systolic", "glucose", "heartRate"]) {
@@ -398,7 +656,7 @@ app.put("/api/targets", auth, (req, res) => {
       );
   }
   req.state.targets = req.body;
-  changed(req, res, "Edited", "Personal reference ranges");
+  changed(req, res, "Edited", "Personal reference ranges", {}, ["targets"]);
 });
 app.post("/api/grants", auth, (req, res) => {
   const b = req.body;
@@ -435,8 +693,9 @@ app.post("/api/grants", auth, (req, res) => {
     tokenHash: hash(token),
   };
   req.state.grants.push(g);
-  audit(
+  recordAudit(
     req.state,
+    req.user.id,
     "Authorized",
     `${g.recipient} · ${g.types.join(", ")} · expires ${g.expires}`,
     "You",
@@ -444,7 +703,7 @@ app.post("/api/grants", auth, (req, res) => {
   );
   db.exec("BEGIN");
   try {
-    save(req.user.id, req.state);
+    save(req.user.id, req.state, ["grants"]);
     db.prepare("INSERT INTO shares VALUES (?,?,?)").run(
       hash(token),
       req.user.id,
@@ -455,13 +714,13 @@ app.post("/api/grants", auth, (req, res) => {
     db.exec("ROLLBACK");
     throw e;
   }
-  res.json({ state: safeState(req.state), url: `${origin}/share/${token}` });
+  res.json({ ok: true, url: `${origin}/share/${token}` });
 });
 app.post("/api/grants/:id/revoke", auth, (req, res) => {
   const g = req.state.grants.find((g) => g.id === req.params.id);
   if (!g) return fail(res, "Authorization not found.", 404);
   g.revoked = true;
-  changed(req, res, "Revoked", `Access for ${g.recipient}`);
+  changed(req, res, "Revoked", `Access for ${g.recipient}`, {}, ["grants"]);
 });
 function share(req, res, next) {
   const row = db
@@ -471,28 +730,28 @@ function share(req, res, next) {
   req.owner = load(row.user_id);
   req.grant = req.owner.state.grants.find((g) => g.id === row.grant_id);
   if (!req.grant || !grantActive(req.grant)) {
-    audit(
+    recordAudit(
       req.owner.state,
+      req.owner.id,
       "Denied",
       "Expired or revoked sharing link was opened",
       "Sharing-link visitor",
       req.ip,
     );
-    save(req.owner.id, req.owner.state);
     return fail(res, "This authorization has expired or been revoked.", 403);
   }
   next();
 }
 app.get("/api/shared/:token", share, (req, res) => {
   const s = req.owner.state;
-  audit(
+  recordAudit(
     s,
+    req.owner.id,
     "Viewed",
     `Shared records · ${req.grant.types.join(", ")}`,
     `${req.grant.recipient} (sharing link)`,
     req.ip,
   );
-  save(req.owner.id, s);
   res.json({
     name: s.profile.name,
     grant: {
@@ -501,8 +760,30 @@ app.get("/api/shared/:token", share, (req, res) => {
       editable: req.grant.editable,
       lockAllergies: req.grant.lockAllergies,
     },
-    records: scopedRecords(s, req.grant),
+    records: scopedRecords(s, req.grant).map((record) => ({
+      ...record,
+      file: record.file
+        ? {
+            ...record.file,
+            url: `/api/shared/${req.params.token}/attachments/${record.file.id}`,
+          }
+        : null,
+    })),
   });
+});
+app.get("/api/shared/:token/attachments/:id", share, (req, res) => {
+  const record = scopedRecords(req.owner.state, req.grant).find(
+    (item) => item.file?.id === req.params.id,
+  );
+  if (!record) return fail(res, "Attachment not found.", 404);
+  const content = attachmentContent(req.owner.id, req.params.id),
+    match = content &&
+      /^data:(application\/pdf|image\/(?:png|jpeg));base64,(.+)$/.exec(content);
+  if (!match) return fail(res, "Attachment not found.", 404);
+  res
+    .type(match[1])
+    .attachment(record.file.name)
+    .send(Buffer.from(match[2], "base64"));
 });
 app.put("/api/shared/:token/records/:id", share, (req, res) => {
   const s = req.owner.state,
@@ -513,19 +794,21 @@ app.put("/api/shared/:token/records/:id", share, (req, res) => {
     return fail(res, "Enter notes under 20,000 characters.");
   const r = { ...old, notes: req.body.notes, version: old.version + 1 };
   s.records = s.records.map((x) => (x.id === r.id ? r : x));
-  s.history.unshift({
+  addHistory(s, {
     id: id(),
     timestamp: new Date().toISOString(),
     title: r.title,
     detail: `Updated through ${req.grant.recipient} sharing link`,
-    before: old,
-    snapshot: r,
-  });
-  audit(s, "Edited", r.title, `${req.grant.recipient} (sharing link)`, req.ip);
-  save(req.owner.id, s);
+    before: historyRecord(old),
+    snapshot: historyRecord(r),
+  }, r.id);
+  recordAudit(s, req.owner.id, "Edited", r.title, `${req.grant.recipient} (sharing link)`, req.ip);
+  save(req.owner.id, s, ["records", "history"], [r]);
   res.json({ ok: true });
 });
 function doImport(req, res, bundle) {
+  if (bundle?.resourceType !== "Bundle" || !Array.isArray(bundle.entry))
+    return fail(res, "Choose a FHIR Bundle JSON file.");
   req.state = load(req.user.id).state;
   const incoming = importFHIR(bundle),
     known = new Set(req.state.records.map((r) => r.externalId).filter(Boolean)),
@@ -536,16 +819,16 @@ function doImport(req, res, bundle) {
     });
   req.state.records.push(...fresh);
   for (const r of fresh)
-    req.state.history.unshift({
+    addHistory(req.state, {
       id: id(),
       timestamp: new Date().toISOString(),
       title: r.title,
       detail: "Imported from FHIR",
       snapshot: r,
-    });
+    }, r.id);
   changed(req, res, "Imported", `${fresh.length} hospital records`, {
     count: fresh.length,
-  });
+  }, ["records", "history"], fresh);
 }
 app.post("/api/import", auth, (req, res) => doImport(req, res, req.body));
 app.post("/api/sync", auth, async (req, res) => {
@@ -591,28 +874,37 @@ app.post("/api/sync", auth, async (req, res) => {
   doImport(req, res, b);
 });
 app.get("/api/export", auth, (req, res) => {
-  audit(
+  recordAudit(
     req.state,
+    req.user.id,
     "Exported",
     "Full health archive and access log",
     "You",
     req.ip,
   );
-  save(req.user.id, req.state);
+  const exported = safeState(req.state);
+  exported.records = exported.records.map((record) => ({
+    ...record,
+    file: record.file
+      ? {
+          ...record.file,
+          data: attachmentContent(req.user.id, record.file.id),
+        }
+      : null,
+  }));
   res.json({
     format: "folio-archive-v1",
     exportedAt: new Date().toISOString(),
-    state: { ...safeState(req.state), passkeys: [] },
+    state: { ...exported, passkeys: [] },
   });
 });
 app.get("/api/history", auth, (req, res) => {
-  audit(req.state, "Viewed", "Revision history", "You", req.ip);
-  save(req.user.id, req.state);
+  recordAudit(req.state, req.user.id, "Viewed", "Revision history", "You", req.ip);
   res.json(req.state.history);
 });
 app.put("/api/settings", auth, (req, res) => {
   req.state.settings.social = false;
-  changed(req, res, "Edited", "Preferences saved");
+  changed(req, res, "Edited", "Preferences saved", {}, ["settings"]);
 });
 const challenges = new Map();
 app.get("/api/passkeys/register/options", auth, async (req, res) => {
@@ -655,14 +947,14 @@ app.post("/api/passkeys/register/verify", auth, async (req, res) => {
     publicKey: Buffer.from(p.publicKey).toString("base64"),
     name: "Device passkey",
   });
-  changed(req, res, "Added", "Device passkey registered");
+  changed(req, res, "Added", "Device passkey registered", {}, ["passkeys"]);
 });
 app.post("/api/auth/passkey/options", async (req, res) => {
   const u = db
     .prepare("SELECT * FROM users WHERE email=? AND demo=0")
     .get(String(req.body.email).toLowerCase().trim());
   if (!u) return fail(res, "No passkey is available for this account.");
-  const s = decrypt(u.state);
+  const s = load(u.id).state;
   if (!s.passkeys.length)
     return fail(
       res,
@@ -702,8 +994,8 @@ app.post("/api/auth/passkey/verify", async (req, res) => {
   });
   if (!v.verified) return fail(res, "Device verification failed.");
   p.counter = v.authenticationInfo.newCounter;
-  audit(u.state, "Signed in", "Device passkey", "You", req.ip);
-  save(u.id, u.state);
+  recordAudit(u.state, u.id, "Signed in", "Device passkey", "You", req.ip);
+  save(u.id, u.state, ["passkeys"]);
   session(req, res, u.id);
   res.json({ ok: true });
 });
@@ -724,7 +1016,7 @@ app.post("/api/auth/sms/send", async (req, res) => {
     .get(String(req.body.email).toLowerCase().trim());
   const requestId = id();
   if (u) {
-    const s = decrypt(u.state);
+    const s = load(u.id).state;
     if (/^\+[1-9]\d{7,14}$/.test(s.profile.phone)) {
       const result = await fetch(
         `https://verify.twilio.com/v2/Services/${process.env.TWILIO_VERIFY_SERVICE_SID}/Verifications`,
@@ -773,20 +1065,23 @@ app.post("/api/auth/sms/verify", async (req, res) => {
   if (v.status !== "approved") return fail(res, "Code is incorrect.");
   codes.delete(req.body.requestId);
   const u = load(c.uid);
-  audit(u.state, "Signed in", "SMS verification", "You", req.ip);
-  save(u.id, u.state);
+  recordAudit(u.state, u.id, "Signed in", "SMS verification", "You", req.ip);
   session(req, res, u.id);
   res.json({ ok: true });
 });
 app.use("/api", (req, res) => fail(res, "Endpoint not found.", 404));
 app.use((err, req, res, next) => {
-  console.error(err.message);
-  res.status(err.status === 413 ? 413 : 400).json({
-    error:
-      err.status === 413
-        ? "This file is too large."
-        : err.message || "The request could not be completed.",
-  });
+  if (res.headersSent) return next(err);
+  if (err instanceof ClientError)
+    return res.status(err.status).json({ error: err.message });
+  if (err.type === "entity.parse.failed")
+    return res.status(400).json({ error: "Invalid JSON request body." });
+  if (err.type === "entity.too.large")
+    return res.status(413).json({ error: "This request body is too large." });
+  if (err.type === "encoding.unsupported" || err.type === "charset.unsupported")
+    return res.status(415).json({ error: "This request encoding is not supported." });
+  console.error(err);
+  res.status(500).json({ error: "The request could not be completed." });
 });
 if (process.argv.includes("--production")) {
   app.use(express.static(path.join(root, "dist")));

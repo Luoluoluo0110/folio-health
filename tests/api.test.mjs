@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createCipheriv, randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import os from "node:os";
 const port = 5187,
@@ -47,6 +49,7 @@ async function call(url, { cookie, body, method, origin } = {}) {
     cookie: r.headers.get("set-cookie")?.split(";")[0],
   };
 }
+const getState = async (cookie) => (await call("/state", { cookie })).data.state;
 test("authenticated health workflows enforce isolation, locks, revocation, and persist history", async (t) => {
   await ready;
   t.after(() => child.kill());
@@ -80,6 +83,44 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
     ).status,
     403,
   );
+  for (const name of [123, null, {}, []]) {
+    const invalidName = await call("/profile", {
+      cookie,
+      method: "PUT",
+      body: { name },
+    });
+    assert.equal(invalidName.status, 400);
+    assert.match(invalidName.data.error, /name/i);
+    assert.doesNotMatch(invalidName.data.error, /trim|TypeError|Cannot read/i);
+  }
+  for (const dob of [123, null, {}, "2026-02-31", "09/01/1990"]) {
+    const invalidDob = await call("/profile", {
+      cookie,
+      method: "PUT",
+      body: { dob },
+    });
+    assert.equal(invalidDob.status, 400);
+    assert.match(invalidDob.data.error, /date of birth/i);
+  }
+  assert.equal(
+    (await call("/profile", {
+      cookie,
+      method: "PUT",
+      body: { dob: "1990-09-01" },
+    })).status,
+    200,
+  );
+  const beforeInvalidProfileField = (await getState(cookie)).profile;
+  const invalidProfileField = await call("/profile", {
+    cookie,
+    method: "PUT",
+    body: { name: "Should not persist", allergies: { value: "invalid" } },
+  });
+  assert.equal(invalidProfileField.status, 400);
+  assert.match(invalidProfileField.data.error, /profile fields must be text/i);
+  const afterInvalidProfileField = (await getState(cookie)).profile;
+  assert.equal(afterInvalidProfileField.name, beforeInvalidProfileField.name);
+  assert.equal(afterInvalidProfileField.allergies, beforeInvalidProfileField.allergies);
   const lab = {
     title: "PRIVATE-LAB-TEXT",
     type: "Lab result",
@@ -91,22 +132,27 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
   };
   let r = await call("/records", { cookie, body: lab });
   assert.equal(r.status, 200);
-  const labId = r.data.state.records[0].id;
+  assert.equal(r.data.ok, true);
+  assert.ok(!r.data.state);
+  const labId = (await getState(cookie)).records[0].id;
   r = await call(`/records/${labId}`, {
     cookie,
     method: "PUT",
     body: { ...lab, notes: "Revised notes" },
   });
-  assert.equal(r.data.state.history[0].before.notes, "Original notes");
-  assert.equal(r.data.state.records[0].version, 2);
+  assert.equal(r.data.ok, true);
+  assert.equal((await getState(cookie)).records[0].version, 2);
+  assert.equal((await call("/history", { cookie })).data[0].before.notes, "Original notes");
   const profileChange = await call("/profile", {
     cookie,
     method: "PUT",
     body: { name: "Updated owner", allergies: "Sample allergy" },
   });
-  assert.equal(profileChange.data.state.history[0].before.name, "Test owner");
+  assert.equal(profileChange.data.ok, true);
+  const profileHistory = await call("/history", { cookie });
+  assert.equal(profileHistory.data[0].before.name, "Test owner");
   assert.equal(
-    profileChange.data.state.history[0].snapshot.name,
+    profileHistory.data[0].snapshot.name,
     "Updated owner",
   );
   assert.equal(
@@ -118,7 +164,7 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
     cookie,
     body: { ...lab, title: "Locked allergy", type: "Allergy" },
   });
-  const allergyId = r.data.state.records.find((r) => r.type === "Allergy").id;
+  const allergyId = (await getState(cookie)).records.find((r) => r.type === "Allergy").id;
   r = await call("/metrics", {
     cookie,
     body: {
@@ -166,6 +212,147 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
     ).status,
     404,
   );
+  const pdf = `data:application/pdf;base64,${Buffer.alloc(5 * 1024 * 1024, 65).toString("base64")}`;
+  const attachedIds = [];
+  for (let index = 0; index < 3; index++) {
+    const attached = await call("/records", {
+      cookie,
+      body: {
+        ...lab,
+        title: `Attached report ${index}`,
+        date: "2026-08-01",
+        file: { name: `report-${index}.pdf`, data: pdf },
+      },
+    });
+    assert.equal(attached.status, 200);
+    assert.equal(attached.data.ok, true);
+    assert.ok(Buffer.byteLength(JSON.stringify(attached.data)) < 1000);
+    const saved = (await getState(cookie)).records.find(
+      (record) => record.title === `Attached report ${index}`,
+    );
+    assert.ok(saved.file.id);
+    assert.ok(!("data" in saved.file));
+    attachedIds.push(saved.file.id);
+    const response = await fetch(base + saved.file.url, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.arrayBuffer()).byteLength, 5 * 1024 * 1024);
+  }
+  const historyWithFiles = await call("/history", { cookie });
+  assert.ok(!JSON.stringify(historyWithFiles.data).includes(pdf));
+  assert.equal(new Set(attachedIds).size, 3, "each uploaded attachment has its own id");
+  let attachmentsDb = new DatabaseSync(path.join(dir, "folio.sqlite"));
+  assert.equal(
+    attachmentsDb.prepare("SELECT state FROM users WHERE email=?").get("owner@test.example").state,
+    "",
+  );
+  assert.equal(
+    attachmentsDb.prepare("SELECT count(*) AS count FROM attachments").get().count,
+    3,
+  );
+  const sectionRows = () =>
+    attachmentsDb
+      .prepare("SELECT section,value FROM user_state_sections WHERE user_id=(SELECT id FROM users WHERE email=?) ORDER BY section")
+      .all("owner@test.example");
+  const recordRows = () =>
+    attachmentsDb
+      .prepare("SELECT record_id,value FROM user_records WHERE user_id=(SELECT id FROM users WHERE email=?) ORDER BY record_id")
+      .all("owner@test.example");
+  const recordsBefore = (await getState(cookie)).records.length;
+  assert.ok(!sectionRows().some(({ section }) => section === "records"));
+  assert.equal(recordRows().length, recordsBefore, "each record is stored in its own encrypted row");
+  const beforeRead = sectionRows();
+  const logsBeforeRead = attachmentsDb
+    .prepare("SELECT count(*) AS count FROM access_logs WHERE user_id=(SELECT id FROM users WHERE email=?)")
+    .get("owner@test.example").count;
+  await call("/state", { cookie });
+  await call("/history", { cookie });
+  assert.deepEqual(sectionRows(), beforeRead, "read auditing does not rewrite state sections");
+  assert.equal(
+    attachmentsDb
+      .prepare("SELECT count(*) AS count FROM access_logs WHERE user_id=(SELECT id FROM users WHERE email=?)")
+      .get("owner@test.example").count,
+    logsBeforeRead + 2,
+  );
+  const beforeTinyMutation = new Map(
+    recordRows().map(({ record_id, value }) => [record_id, value]),
+  );
+  const tinyStart = performance.now();
+  const tinyMutation = await call("/records", {
+    cookie,
+    body: { ...lab, title: "Small record with three large attachments", file: null },
+  });
+  const tinyDuration = performance.now() - tinyStart;
+  assert.equal(tinyMutation.status, 200);
+  assert.ok(Buffer.byteLength(JSON.stringify(tinyMutation.data)) < 1000);
+  assert.ok(tinyDuration < 100, `small record mutation with 3 files took ${tinyDuration.toFixed(1)} ms`);
+  const afterTinyMutation = new Map(
+    recordRows().map(({ record_id, value }) => [record_id, value]),
+  );
+  for (const [recordId, value] of beforeTinyMutation)
+    assert.equal(afterTinyMutation.get(recordId), value, "adding a record does not rewrite existing record rows");
+  assert.equal(afterTinyMutation.size, beforeTinyMutation.size + 1);
+
+  const attachedRecord = (await getState(cookie)).records.find(
+    (record) => record.title === "Attached report 0",
+  );
+  assert.equal(attachedRecord.file.id, attachedIds[0]);
+  const beforeRecordEdit = new Map(
+    recordRows().map(({ record_id, value }) => [record_id, value]),
+  );
+  const removeAttachment = await call(`/records/${attachedRecord.id}`, {
+    cookie,
+    method: "PUT",
+    body: { ...lab, title: attachedRecord.title, date: attachedRecord.date, file: null },
+  });
+  assert.equal(removeAttachment.status, 200, JSON.stringify(removeAttachment.data));
+  const afterRecordEdit = new Map(
+    recordRows().map(({ record_id, value }) => [record_id, value]),
+  );
+  assert.notEqual(afterRecordEdit.get(attachedRecord.id), beforeRecordEdit.get(attachedRecord.id));
+  for (const [recordId, value] of beforeRecordEdit)
+    if (recordId !== attachedRecord.id)
+      assert.equal(afterRecordEdit.get(recordId), value, "editing a record does not rewrite other record rows");
+  const updatedAttachedRecord = (await getState(cookie)).records.find(
+    (record) => record.id === attachedRecord.id,
+  );
+  assert.equal(updatedAttachedRecord.file, null);
+  const recordRefs = (await getState(cookie)).records.filter(
+    (record) => record.file?.id === attachedIds[0],
+  );
+  assert.equal(recordRefs.length, 0, "no current record references the removed attachment");
+  attachmentsDb.close();
+  attachmentsDb = new DatabaseSync(path.join(dir, "folio.sqlite"));
+  assert.equal(
+    attachmentsDb.prepare("SELECT count(*) AS count FROM attachments").get().count,
+    2,
+    "replacing/removing a file deletes its now-unreferenced encrypted blob",
+  );
+
+  const legacyRecords = (await getState(cookie)).records.map((record) => {
+    const { url, ...file } = record.file || {};
+    return { ...record, file: record.file ? file : null };
+  });
+  const key = readFileSync(path.join(dir, "encryption.key")),
+    iv = randomBytes(12),
+    cipher = createCipheriv("aes-256-gcm", key, iv),
+    encryptedRecords = Buffer.concat([
+      cipher.update(JSON.stringify(legacyRecords)),
+      cipher.final(),
+    ]),
+    encryptedSection = Buffer.concat([iv, cipher.getAuthTag(), encryptedRecords]).toString("base64");
+  const ownerId = attachmentsDb
+    .prepare("SELECT id FROM users WHERE email=?")
+    .get("owner@test.example").id;
+  attachmentsDb.prepare("DELETE FROM user_records WHERE user_id=?").run(ownerId);
+  attachmentsDb
+    .prepare("INSERT INTO user_state_sections (user_id,section,value) VALUES (?, 'records', ?)")
+    .run(ownerId, encryptedSection);
+  assert.equal((await getState(cookie)).records.length, legacyRecords.length);
+  assert.equal(recordRows().length, legacyRecords.length);
+  assert.ok(!sectionRows().some(({ section }) => section === "records"));
+  attachmentsDb.close();
   const g = await call("/grants", {
     cookie,
     body: {
@@ -180,9 +367,10 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
     },
   });
   assert.equal(g.status, 200);
+  assert.equal(g.data.ok, true);
   const token = g.data.url.split("/").at(-1),
-    grantId = g.data.state.grants[0].id;
-  assert.equal((await call(`/shared/${token}`)).data.records.length, 2);
+    grantId = (await getState(cookie)).grants[0].id;
+  assert.equal((await call(`/shared/${token}`)).data.records.length, 3);
   assert.equal(
     (
       await call(`/shared/${token}/records/${allergyId}`, {
@@ -248,9 +436,9 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
     method: "PUT",
     body: { ...lab, title: "Edited import", notes: "Edited after import" },
   });
+  assert.equal(editedImport.data.ok, true);
   assert.equal(
-    editedImport.data.state.records.find((r) => r.id === imported.id)
-      .externalId,
+    (await getState(cookie)).records.find((r) => r.id === imported.id).externalId,
     "Observation/lab-1",
     "editing a record preserves its external id",
   );
@@ -292,8 +480,42 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
       password: "test-password-at-least-12",
     },
   });
-  assert.ok(
-    (await call("/state", { cookie: again.cookie })).data.state.records
-      .length >= 3,
-  );
+  assert.equal(again.status, 200, JSON.stringify(again.data));
+  assert.ok(again.cookie);
+  const persistedAgain = await call("/state", { cookie: again.cookie });
+  assert.equal(persistedAgain.status, 200, JSON.stringify(persistedAgain.data));
+  assert.ok(persistedAgain.data.state.records.length >= 3);
+
+  const malformedJson = await fetch(`${base}/api/profile`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: again.cookie,
+    },
+    body: "{",
+  });
+  assert.equal(malformedJson.status, 400);
+  const malformedBody = await malformedJson.json();
+  assert.equal(malformedBody.error, "Invalid JSON request body.");
+  assert.doesNotMatch(JSON.stringify(malformedBody), /JSON.*position|Unexpected token/i);
+
+  const brokenAccount = await call("/auth/register", {
+    body: {
+      name: "Broken state test",
+      email: "broken-state@test.example",
+      password: "test-password-at-least-12",
+    },
+  });
+  const brokenDb = new DatabaseSync(path.join(dir, "folio.sqlite"));
+  brokenDb
+    .prepare(
+      "UPDATE user_state_sections SET value='not-valid-ciphertext' WHERE user_id=(SELECT id FROM users WHERE email=?) AND section='profile'",
+    )
+    .run("broken-state@test.example");
+  brokenDb.close();
+  const internalFailure = await call("/state", { cookie: brokenAccount.cookie });
+  assert.equal(internalFailure.status, 500);
+  assert.equal(internalFailure.data.error, "The request could not be completed.");
+  assert.doesNotMatch(JSON.stringify(internalFailure.data), /initialization vector|ciphertext/i);
+  assert.match(output, /Invalid authentication tag length|Invalid initialization vector/);
 });
