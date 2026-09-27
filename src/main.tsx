@@ -171,40 +171,56 @@ function fuzzy(value: string, query: string) {
 }
 function Modal({
   title,
+  focusKey,
   subtitle,
   children,
   onClose,
   wide = false,
 }: {
   title: string;
+  focusKey: string;
   subtitle?: string;
   children: React.ReactNode;
   onClose: () => void;
   wide?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
     const previous = document.activeElement as HTMLElement;
     const focusable = () =>
       Array.from(
         ref.current?.querySelectorAll<HTMLElement>(
-          'button,input,select,textarea,a[href],[tabindex="0"]',
+          'a[href],area[href],button,input,select,textarea,summary,[tabindex],[contenteditable]:not([contenteditable="false"])',
         ) || [],
-      ).filter((e) => !(e as HTMLButtonElement).disabled);
-    focusable()[0]?.focus();
+      ).filter((element) => {
+        const style = window.getComputedStyle(element);
+        return (
+          !element.hasAttribute("hidden") &&
+          !element.matches(":disabled") &&
+          element.tabIndex >= 0 &&
+          style.visibility !== "hidden" &&
+          style.display !== "none" &&
+          element.getClientRects().length > 0
+        );
+      });
     const listener = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-      if (e.key === "Tab") {
-        const els = focusable(),
-          first = els[0],
-          last = els.at(-1);
-        if (e.shiftKey && document.activeElement === first) {
-          e.preventDefault();
-          last?.focus();
-        } else if (!e.shiftKey && document.activeElement === last) {
-          e.preventDefault();
-          first?.focus();
-        }
+      if (e.key === "Escape") onCloseRef.current();
+      if (e.key !== "Tab") return;
+      const elements = focusable(),
+        first = elements[0],
+        last = elements.at(-1),
+        activeIndex = elements.indexOf(document.activeElement as HTMLElement);
+      if (!first || !last) {
+        e.preventDefault();
+        ref.current?.focus();
+      } else if (e.shiftKey && activeIndex <= 0) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && (activeIndex < 0 || activeIndex === elements.length - 1)) {
+        e.preventDefault();
+        first.focus();
       }
     };
     document.addEventListener("keydown", listener);
@@ -216,6 +232,9 @@ function Modal({
       previous?.focus();
     };
   }, []);
+  useEffect(() => {
+    ref.current?.focus();
+  }, [focusKey]);
   return (
     <div
       className="modal-backdrop"
@@ -228,6 +247,7 @@ function Modal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="dialog-title"
+        tabIndex={-1}
         ref={ref}
       >
         <div className="modal-heading">
@@ -1706,6 +1726,7 @@ function App() {
       )}
       {modal && (
         <Modal
+          focusKey={modal}
           title={
             {
               record: record ? "Edit health record" : "Add a health record",
@@ -2852,6 +2873,7 @@ function SharedView({ token }: { token: string }) {
       {editing && (
         <Modal
           title="Edit shared record notes"
+          focusKey="shared-record-edit"
           onClose={() => setEditing(null)}
         >
           <form
