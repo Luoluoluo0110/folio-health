@@ -133,9 +133,9 @@ async function api(url: string, body?: unknown, method?: string) {
     throw new Error(data.error || "Something went wrong. Please try again.");
   return data;
 }
-function download(name: string, data: string) {
+function download(name: string, url: string) {
   const a = document.createElement("a");
-  a.href = data;
+  a.href = url;
   a.download = name;
   a.click();
 }
@@ -375,6 +375,7 @@ function App() {
     try {
       const d = await api(url, body, method);
       if (d.state) setState(d.state);
+      else await load();
       if (success) notify(success);
       return d;
     } catch (e) {
@@ -395,7 +396,8 @@ function App() {
     open("view");
     try {
       const d = await api(`/records/${r.id}/view`, {});
-      setState(d.state);
+      if (d.state) setState(d.state);
+      else await load();
     } catch (e) {
       setError((e as Error).message);
     }
@@ -1780,7 +1782,7 @@ function App() {
               {record.file && (
                 <button
                   className="attachment"
-                  onClick={() => download(record.file!.name, record.file!.data)}
+                  onClick={() => download(record.file!.name, record.file!.url!)}
                 >
                   <FileText size={20} />
                   <span>{record.file.name}</span>
@@ -2228,7 +2230,14 @@ function RecordForm({
   onCancel: () => void;
   busy: boolean;
 }) {
-  const [file, setFile] = useState(record?.file || null),
+  const [file, setFile] = useState<{
+    id?: string;
+    name: string;
+    type?: string;
+    size?: number;
+    url?: string;
+    data?: string;
+  } | null>(record?.file || null),
     [fileError, setFileError] = useState("");
   return (
     <form
@@ -2823,7 +2832,7 @@ function SharedView({ token }: { token: string }) {
                   {r.file && (
                     <button
                       className="secondary"
-                      onClick={() => download(r.file!.name, r.file!.data)}
+                      onClick={() => download(r.file!.name, r.file!.url!)}
                     >
                       <ArrowDownToLine size={16} />
                       Download report
