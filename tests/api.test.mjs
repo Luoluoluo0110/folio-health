@@ -1,10 +1,25 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { once } from "node:events";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
 import path from "node:path";
 import os from "node:os";
-const port = 5187,
+async function availablePort() {
+  const server = createServer();
+  server.unref();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const { port } = server.address();
+  await new Promise((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+  return port;
+}
+const port = await availablePort(),
   base = `http://localhost:${port}`,
   dir = mkdtempSync(path.join(os.tmpdir(), "folio-test-"));
 const child = spawn(process.execPath, ["server/index.mjs", "--production"], {
@@ -28,7 +43,12 @@ const ready = new Promise((resolve, reject) => {
     }
   });
   child.on("exit", (code) => {
-    if (code) reject(new Error(output));
+    clearTimeout(timeout);
+    reject(new Error(output || `Server exited before startup (code ${code}).`));
+  });
+  child.on("error", (error) => {
+    clearTimeout(timeout);
+    reject(error);
   });
 });
 async function call(url, { cookie, body, method, origin } = {}) {
@@ -48,8 +68,18 @@ async function call(url, { cookie, body, method, origin } = {}) {
   };
 }
 test("authenticated health workflows enforce isolation, locks, revocation, and persist history", async (t) => {
+  t.after(async () => {
+    try {
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = once(child, "exit");
+        child.kill();
+        await exited;
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   await ready;
-  t.after(() => child.kill());
   assert.equal((await call("/state")).status, 401);
   const a = await call("/auth/register", {
     body: {
