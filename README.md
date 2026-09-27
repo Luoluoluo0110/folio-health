@@ -38,7 +38,7 @@ The server listens on the local loopback interface. It is not publicly deployed.
 
 ## Provider setup
 
-Copy `.env.example` to `.env`, fill in the relevant values, and run:
+Copy `.env.example` to `.env` and fill in the relevant values. Both `npm start` and `npm run dev` load this optional file automatically. The equivalent direct production command is:
 
 ```powershell
 node --env-file=.env server/index.mjs --production
