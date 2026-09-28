@@ -7,6 +7,7 @@ import {
   canEdit,
   fuzzyMatch,
   importFHIR,
+  fhirImportWarnings,
   fhirEntryDate,
 } from "../server/model.mjs";
 test("new accounts are empty and do not inherit another person’s history", () => {
@@ -150,6 +151,75 @@ test("FHIR imports keep quantity, string, coded and component observation values
     }),
     "Systolic: 120 mmHg\nDiastolic: 78 mmHg",
   );
+});
+test("DocumentReference imports preserve titles, descriptions and readable inline content", () => {
+  const records = importFHIR({
+    resourceType: "Bundle",
+    entry: [
+      {
+        resource: {
+          resourceType: "DocumentReference",
+          id: "document-1",
+          description: "Discharge summary",
+          date: "2026-09-01",
+          content: [
+            {
+              attachment: {
+                title: "Aftercare instructions",
+                contentType: "text/plain",
+                data: Buffer.from("Drink plenty of water.").toString("base64"),
+              },
+            },
+          ],
+        },
+      },
+    ],
+  });
+  assert.equal(records[0].type, "Visit summary");
+  assert.equal(records[0].title, "Aftercare instructions");
+  assert.match(records[0].notes, /Discharge summary/);
+  assert.match(records[0].notes, /Aftercare instructions/);
+  assert.match(records[0].notes, /Drink plenty of water\./);
+});
+test("DocumentReference reports attachments that cannot be imported", () => {
+  const bundle = {
+    resourceType: "Bundle",
+    entry: [
+      {
+        resource: {
+          resourceType: "DocumentReference",
+          id: "document-2",
+          description: "External report",
+          date: "2026-09-01",
+          content: [{ attachment: { title: "PDF report", url: "https://example.test/report.pdf" } }],
+        },
+      },
+    ],
+  };
+  const records = importFHIR(bundle);
+  assert.match(records[0].notes, /only available at a remote URL/);
+  assert.match(fhirImportWarnings(bundle)[0], /PDF report/);
+});
+test("DocumentReference keeps readable inline data when content type is omitted", () => {
+  const record = importFHIR({
+    resourceType: "Bundle",
+    entry: [
+      {
+        resource: {
+          resourceType: "DocumentReference",
+          date: "2026-09-01",
+          content: [
+            {
+              attachment: {
+                data: Buffer.from("Plain text from the export").toString("base64"),
+              },
+            },
+          ],
+        },
+      },
+    ],
+  })[0];
+  assert.match(record.notes, /Plain text from the export/);
 });
 test("FHIR entries only fail to import when they cannot become a record", () => {
   assert.equal(
