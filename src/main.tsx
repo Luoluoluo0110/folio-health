@@ -420,7 +420,10 @@ function App() {
         throw new Error("Choose a FHIR JSON file smaller than 8 MB.");
       const data = JSON.parse(await file.text());
       const d = await mutate("/import", data);
-      notify(`${d.count} hospital records imported and organized.`);
+      const warning = d.warnings?.length
+        ? ` Attachment limits: ${d.warnings.join(" ")}`
+        : "";
+      notify(`${d.count} hospital records imported and organized.${warning}`);
       close();
     } catch (e) {
       setError((e as Error).message);

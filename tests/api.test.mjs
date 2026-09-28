@@ -286,6 +286,38 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
     2,
     "the import response reports both unmapped types and unusable dates",
   );
+  const documentImport = await call("/import", {
+    cookie,
+    body: {
+      resourceType: "Bundle",
+      entry: [
+        {
+          resource: {
+            resourceType: "DocumentReference",
+            id: "remote-document",
+            description: "External discharge report",
+            date: "2026-09-03",
+            content: [
+              {
+                attachment: {
+                  title: "Remote PDF",
+                  url: "https://example.test/discharge.pdf",
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+  });
+  assert.equal(documentImport.data.count, 1);
+  assert.match(documentImport.data.warnings[0], /Remote PDF/);
+  assert.equal(
+    documentImport.data.state.records.find(
+      (r) => r.externalId === "DocumentReference/remote-document",
+    ).type,
+    "Visit summary",
+  );
   const archive = await call("/export", { cookie });
   assert.equal(archive.data.format, "folio-archive-v1");
   assert.ok(
