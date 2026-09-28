@@ -145,6 +145,22 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
     ).status,
     400,
   );
+  const targets = await call("/targets", {
+    cookie,
+    method: "PUT",
+    body: {
+      systolic: { min: "100", max: "130" },
+      glucose: { min: "70", max: "100" },
+      heartRate: { min: "60", max: "100" },
+      ignored: "value",
+    },
+  });
+  assert.equal(targets.status, 200);
+  assert.deepEqual(targets.data.state.targets, {
+    systolic: { min: 100, max: 130 },
+    glucose: { min: 70, max: 100 },
+    heartRate: { min: 60, max: 100 },
+  });
   const b = await call("/auth/register", {
     body: {
       name: "Other owner",

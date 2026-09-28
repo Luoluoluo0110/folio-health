@@ -357,10 +357,7 @@ function App() {
   const open = (name: string) => {
     setError("");
     setModal(name);
-    if (name === "history")
-      api("/history")
-        .then(() => load())
-        .catch((e) => setError(e.message));
+    if (name === "history") load();
   };
   const close = () => {
     setModal("");
