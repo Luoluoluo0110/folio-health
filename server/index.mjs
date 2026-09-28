@@ -64,8 +64,8 @@ app.use((req, res, next) => {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "X-Frame-Options": "DENY",
-    "Cache-Control": "no-store",
   });
+  if (req.path.startsWith("/api/")) res.set("Cache-Control", "no-store");
   if (
     req.path.startsWith("/api/") &&
     !["GET", "HEAD"].includes(req.method) &&
@@ -412,8 +412,8 @@ app.post("/api/grants", auth, (req, res) => {
     !validDate(b.from) ||
     !validDate(b.to) ||
     b.from > b.to ||
-    !Number.isFinite(+b.days) ||
-    +b.days <= 0 ||
+    !Number.isInteger(+b.days) ||
+    +b.days < 1 ||
     +b.days > 90
   )
     return fail(
@@ -795,7 +795,14 @@ app.use((err, req, res, next) => {
   });
 });
 if (process.argv.includes("--production")) {
-  app.use(express.static(path.join(root, "dist")));
+  app.use(
+    "/assets",
+    express.static(path.join(root, "dist/assets"), {
+      immutable: true,
+      maxAge: "1y",
+    }),
+  );
+  app.use(express.static(path.join(root, "dist"), { maxAge: 0 }));
   app.get("/{*splat}", (req, res) =>
     res.sendFile(path.join(root, "dist/index.html")),
   );

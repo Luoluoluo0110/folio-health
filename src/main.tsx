@@ -130,7 +130,10 @@ async function api(url: string, body?: unknown, method?: string) {
   });
   const data = await r.json();
   if (!r.ok)
-    throw new Error(data.error || "Something went wrong. Please try again.");
+    throw Object.assign(
+      new Error(data.error || "Something went wrong. Please try again."),
+      { status: r.status },
+    );
   return data;
 }
 function download(name: string, data: string) {
@@ -342,7 +345,7 @@ function App() {
       setServices(d.services);
       setFatal("");
     } catch (e) {
-      if ((e as Error).message.includes("sign in")) setState(null);
+      if ((e as Error & { status?: number }).status === 401) setState(null);
       else setFatal((e as Error).message);
     } finally {
       setLoading(false);
@@ -378,6 +381,12 @@ function App() {
       if (success) notify(success);
       return d;
     } catch (e) {
+      if ((e as Error & { status?: number }).status === 401) {
+        setState(null);
+        setFatal("");
+        close();
+        throw e;
+      }
       setError((e as Error).message);
       throw e;
     } finally {
@@ -2200,10 +2209,12 @@ function FormActions({
   busy,
   onCancel,
   label,
+  busyLabel,
 }: {
   busy: boolean;
   onCancel: () => void;
   label: string;
+  busyLabel?: string;
 }) {
   return (
     <div className="modal-actions">
@@ -2211,7 +2222,7 @@ function FormActions({
         Cancel
       </button>
       <button className="primary" disabled={busy} type="submit">
-        {busy ? "Saving…" : label}
+        {busy ? (busyLabel || "Saving…") : label}
         {!busy && <Check size={16} />}
       </button>
     </div>
@@ -2229,11 +2240,16 @@ function RecordForm({
   busy: boolean;
 }) {
   const [file, setFile] = useState(record?.file || null),
-    [fileError, setFileError] = useState("");
+    [fileError, setFileError] = useState(""),
+    [reading, setReading] = useState(false);
+  const readerRef = useRef<FileReader | null>(null),
+    readId = useRef(0);
+  useEffect(() => () => readerRef.current?.abort(), []);
   return (
     <form
       onSubmit={(e) => {
         e.preventDefault();
+        if (reading) return;
         onSave({ ...Object.fromEntries(new FormData(e.currentTarget)), file });
       }}
     >
@@ -2292,6 +2308,10 @@ function RecordForm({
             type="file"
             accept="application/pdf,image/png,image/jpeg"
             onChange={(e) => {
+              const currentRead = ++readId.current;
+              readerRef.current?.abort();
+              readerRef.current = null;
+              setReading(false);
               const f = e.target.files?.[0];
               if (!f) return;
               if (
@@ -2303,9 +2323,23 @@ function RecordForm({
                 return;
               }
               setFileError("");
+              setFile(null);
+              setReading(true);
               const reader = new FileReader();
-              reader.onload = () =>
+              readerRef.current = reader;
+              reader.onload = () => {
+                if (currentRead !== readId.current) return;
                 setFile({ name: f.name, data: String(reader.result) });
+                setReading(false);
+              };
+              reader.onerror = () => {
+                if (currentRead !== readId.current) return;
+                setFile(null);
+                setFileError(
+                  "The attachment could not be read. Please choose another file.",
+                );
+                setReading(false);
+              };
               reader.readAsDataURL(f);
             }}
           />
@@ -2327,7 +2361,8 @@ function RecordForm({
         {fileError && <p className="form-error span-2">{fileError}</p>}
       </div>
       <FormActions
-        busy={busy}
+        busy={busy || reading}
+        busyLabel={reading ? "Reading file…" : undefined}
         onCancel={onCancel}
         label={record ? "Save changes" : "Add record"}
       />
