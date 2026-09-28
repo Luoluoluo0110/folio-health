@@ -384,8 +384,15 @@ app.post("/api/metrics", auth, (req, res) => {
   changed(req, res, "Added", "Health measurements");
 });
 app.put("/api/targets", auth, (req, res) => {
+  const source = req.body,
+    targets = {};
+  if (!source || typeof source !== "object" || Array.isArray(source))
+    return fail(
+      res,
+      "Each upper limit must be greater than its lower limit.",
+    );
   for (const k of ["systolic", "glucose", "heartRate"]) {
-    const r = req.body[k];
+    const r = source[k];
     if (
       !r ||
       !Number.isFinite(+r.min) ||
@@ -397,8 +404,9 @@ app.put("/api/targets", auth, (req, res) => {
         res,
         "Each upper limit must be greater than its lower limit.",
       );
+    targets[k] = { min: +r.min, max: +r.max };
   }
-  req.state.targets = req.body;
+  req.state.targets = targets;
   changed(req, res, "Edited", "Personal reference ranges");
 });
 app.post("/api/grants", auth, (req, res) => {
