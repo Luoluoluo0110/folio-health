@@ -262,6 +262,30 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
     1,
     "editing an imported record does not cause a duplicate import",
   );
+  assert.equal(
+    (
+      await call("/import", {
+        cookie,
+        body: {
+          ...fhir,
+          entry: [
+            ...fhir.entry,
+            { resource: { resourceType: "Patient", id: "patient-1" } },
+            {
+              resource: {
+                resourceType: "Observation",
+                id: "unusable-date",
+                code: { text: "No usable date" },
+                effectiveDateTime: "09/01/2026",
+              },
+            },
+          ],
+        },
+      })
+    ).data.skipped,
+    2,
+    "the import response reports both unmapped types and unusable dates",
+  );
   const archive = await call("/export", { cookie });
   assert.equal(archive.data.format, "folio-archive-v1");
   assert.ok(
