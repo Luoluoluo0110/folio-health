@@ -65,10 +65,14 @@ textarea {
     transform 0.18s;
 }
 button:focus-visible,
-a:focus-visible {
-  outline: 3px solid #86b5a3;
-  outline-offset: 4px;
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 3px solid var(--teal, #245e53);
+  outline-offset: 2px;
 }
+
 button:hover:not(:disabled) {
   filter: brightness(0.98);
 }
@@ -117,8 +121,15 @@ textarea {
 input:focus,
 select:focus,
 textarea:focus {
-  border-color: #71998a;
-  box-shadow: 0 0 0 3px #eaf2ec;
+  outline: none;
+  border-color: var(--teal, #245e53);
+}
+
+input:focus:not(:focus-visible),
+select:focus:not(:focus-visible),
+textarea:focus:not(:focus-visible) {
+  outline: none;
+  box-shadow: none;
 }
 input::placeholder,
 textarea::placeholder {
