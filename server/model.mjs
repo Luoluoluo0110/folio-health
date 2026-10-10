@@ -8,6 +8,15 @@ export const types = [
   "Imaging",
   "Allergy",
 ];
+// FHIR resource types this adapter maps onto records.
+const fhirResources = [
+  "DiagnosticReport",
+  "DocumentReference",
+  "MedicationRequest",
+  "Encounter",
+  "AllergyIntolerance",
+  "Observation",
+];
 export function initialState(demo = false, name = "Your name") {
   const today = new Date();
   const ago = (n) =>
@@ -203,23 +212,46 @@ export function fuzzyMatch(value, query) {
       });
     });
 }
+const codeText = (concept) =>
+  concept?.text || concept?.coding?.find((c) => c.display)?.display || "";
+const quantityText = (q) =>
+  q && q.value !== undefined ? `${q.value} ${q.unit || ""}`.trim() : "";
+// An Observation carries its result in exactly one of the value[x] fields, and a
+// panel such as blood pressure carries them in component[]. Collect whichever are
+// present, so an imported record never silently loses the reading it exists for.
+const observationValues = (x) =>
+  [
+    quantityText(x.valueQuantity),
+    x.valueString,
+    codeText(x.valueCodeableConcept),
+    x.valueBoolean === undefined ? "" : String(x.valueBoolean),
+    x.valueInteger === undefined ? "" : String(x.valueInteger),
+  ].filter(Boolean);
+// The date an entry would import as, or null when the entry cannot become a
+// record at all. Import callers use this to report what was dropped, so a bundle
+// never loses entries without saying so. An entry with no usable date field falls
+// back to today; an entry carrying a malformed one is rejected rather than given
+// an invented date.
+export function fhirEntryDate(resource) {
+  if (!resource || !fhirResources.includes(resource.resourceType)) return null;
+  const date = (
+    resource.effectiveDateTime ||
+    resource.issued ||
+    resource.date ||
+    resource.authoredOn ||
+    resource.recordedDate ||
+    resource.period?.start ||
+    new Date().toISOString()
+  ).slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : null;
+}
 export function importFHIR(bundle) {
   if (bundle?.resourceType !== "Bundle" || !Array.isArray(bundle.entry))
     throw new Error("Choose a FHIR Bundle JSON file.");
   const records = [];
   for (const { resource: r } of bundle.entry) {
-    if (
-      !r ||
-      ![
-        "DiagnosticReport",
-        "DocumentReference",
-        "MedicationRequest",
-        "Encounter",
-        "AllergyIntolerance",
-        "Observation",
-      ].includes(r.resourceType)
-    )
-      continue;
+    const date = fhirEntryDate(r);
+    if (!date) continue;
     const type =
       r.resourceType === "MedicationRequest"
         ? "Prescription"
@@ -229,22 +261,11 @@ export function importFHIR(bundle) {
             ? "Visit summary"
             : "Lab result";
     const title =
-      r.code?.text ||
-      r.code?.coding?.[0]?.display ||
+      codeText(r.code) ||
       r.type?.text ||
       r.medicationCodeableConcept?.text ||
       r.description ||
       r.resourceType;
-    const date = (
-      r.effectiveDateTime ||
-      r.issued ||
-      r.date ||
-      r.authoredOn ||
-      r.recordedDate ||
-      r.period?.start ||
-      new Date().toISOString()
-    ).slice(0, 10);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
     records.push({
       id: id(),
       externalId: r.id ? `${r.resourceType}/${r.id}` : hash(JSON.stringify(r)),
@@ -255,12 +276,15 @@ export function importFHIR(bundle) {
         r.performer?.[0]?.display ||
         r.author?.[0]?.display ||
         "Hospital import",
-      condition: r.code?.text || "",
+      condition: codeText(r.code),
       notes: [
         r.conclusion,
-        r.valueQuantity
-          ? `${r.valueQuantity.value} ${r.valueQuantity.unit || ""}`
-          : "",
+        ...observationValues(r),
+        ...(r.component || []).map((c) =>
+          [codeText(c.code), ...observationValues(c)]
+            .filter(Boolean)
+            .join(": "),
+        ),
         ...(r.note || []).map((n) => n.text),
       ]
         .filter(Boolean)

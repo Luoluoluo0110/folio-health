@@ -359,21 +359,21 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
   );
   await call(`/grants/${grantId}/revoke`, { cookie, body: {} });
   assert.equal((await call(`/shared/${token}`)).status, 403);
-  const exp = await call("/grants", {
-    cookie,
-    body: {
-      recipient: "Expired",
-      email: "expired@test.example",
-      types: ["Lab result"],
-      from: "2026-09-01",
-      to: "2026-09-01",
-      days: 0.000000001,
-    },
-  });
-  assert.equal(
-    (await call(`/shared/${exp.data.url.split("/").at(-1)}`)).status,
-    403,
-  );
+  for (const days of [0, 0.5, 91]) {
+    const invalidDuration = await call("/grants", {
+      cookie,
+      body: {
+        recipient: "Invalid duration",
+        email: "invalid@test.example",
+        types: ["Lab result"],
+        from: "2026-09-01",
+        to: "2026-09-01",
+        days,
+      },
+    });
+    assert.equal(invalidDuration.status, 400);
+    assert.match(invalidDuration.data.error, /1–90 days/);
+  }
   const fhir = {
     resourceType: "Bundle",
     entry: [
@@ -411,6 +411,30 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
     ).length,
     1,
     "editing an imported record does not cause a duplicate import",
+  );
+  assert.equal(
+    (
+      await call("/import", {
+        cookie,
+        body: {
+          ...fhir,
+          entry: [
+            ...fhir.entry,
+            { resource: { resourceType: "Patient", id: "patient-1" } },
+            {
+              resource: {
+                resourceType: "Observation",
+                id: "unusable-date",
+                code: { text: "No usable date" },
+                effectiveDateTime: "09/01/2026",
+              },
+            },
+          ],
+        },
+      })
+    ).data.skipped,
+    2,
+    "the import response reports both unmapped types and unusable dates",
   );
   const archive = await call("/export", { cookie });
   assert.equal(archive.data.format, "folio-archive-v1");
