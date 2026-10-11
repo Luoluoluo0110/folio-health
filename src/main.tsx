@@ -2828,7 +2828,9 @@ function SharedView({ token }: { token: string }) {
       records: HealthRecord[];
     } | null>(null),
     [error, setError] = useState(""),
-    [editing, setEditing] = useState<HealthRecord | null>(null);
+    [editing, setEditing] = useState<HealthRecord | null>(null),
+    [sharedBusy, setSharedBusy] = useState(false),
+    [editError, setEditError] = useState("");
   const load = () =>
     api(`/shared/${token}`)
       .then(setData)
@@ -2889,7 +2891,10 @@ function SharedView({ token }: { token: string }) {
                     !(data.grant.lockAllergies && r.type === "Allergy") && (
                       <button
                         className="text-button"
-                        onClick={() => setEditing(r)}
+                        onClick={() => {
+                          setEditError("");
+                          setEditing(r);
+                        }}
                       >
                         Edit notes <ArrowRight size={14} />
                       </button>
@@ -2909,11 +2914,17 @@ function SharedView({ token }: { token: string }) {
         <Modal
           title="Edit shared record notes"
           focusKey="shared-record-edit"
-          onClose={() => setEditing(null)}
+          onClose={() => {
+            setEditError("");
+            setEditing(null);
+          }}
         >
           <form
             onSubmit={async (e) => {
               e.preventDefault();
+              if (sharedBusy) return;
+              setSharedBusy(true);
+              setEditError("");
               try {
                 await api(
                   `/shared/${token}/records/${editing.id}`,
@@ -2923,21 +2934,32 @@ function SharedView({ token }: { token: string }) {
                 setEditing(null);
                 load();
               } catch (e) {
-                setError((e as Error).message);
+                setEditError((e as Error).message);
+              } finally {
+                setSharedBusy(false);
               }
             }}
           >
+            {editError && (
+              <div className="form-error" role="alert">
+                {editError}
+              </div>
+            )}
             <Field label="Notes">
               <textarea
                 name="notes"
                 defaultValue={editing.notes}
                 rows={8}
                 maxLength={20000}
+                disabled={sharedBusy}
               />
             </Field>
             <FormActions
-              busy={false}
-              onCancel={() => setEditing(null)}
+              busy={sharedBusy}
+              onCancel={() => {
+                setEditError("");
+                setEditing(null);
+              }}
               label="Save notes"
             />
           </form>

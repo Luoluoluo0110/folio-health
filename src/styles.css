@@ -70,7 +70,7 @@ input:focus-visible,
 select:focus-visible,
 textarea:focus-visible {
   outline: 3px solid var(--teal, #245e53);
-  outline-offset: 2px;
+  outline-offset: 4px;
 }
 
 button:hover:not(:disabled) {
@@ -1385,8 +1385,8 @@ table small {
   margin-top: 10px;
 }
 .clinical-note {
-  font-size: 9px !important;
-  color: #a5ae9a !important;
+  font-size: 9px;
+  color: #a5ae9a;
   line-height: 1.8;
   border-top: 1px solid var(--line);
   margin: 12px 23px 0;
@@ -2430,6 +2430,7 @@ pre {
 .care-tip p,
 .footer-note,
 .app-footer p,
+.app-footer small,
 .demo-note,
 .import-banner p,
 .under-note,
@@ -2467,7 +2468,7 @@ pre {
 .provider-connect p,
 .shared-header p,
 .shared-record > p {
-  color: #7c8875;
+  color: #5f6b58;
 }
 .text-button,
 .tag,
