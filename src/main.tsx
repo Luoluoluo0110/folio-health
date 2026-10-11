@@ -130,7 +130,10 @@ async function api(url: string, body?: unknown, method?: string) {
   });
   const data = await r.json();
   if (!r.ok)
-    throw new Error(data.error || "Something went wrong. Please try again.");
+    throw Object.assign(
+      new Error(data.error || "Something went wrong. Please try again."),
+      { status: r.status },
+    );
   return data;
 }
 function download(name: string, data: string) {
@@ -171,40 +174,56 @@ function fuzzy(value: string, query: string) {
 }
 function Modal({
   title,
+  focusKey,
   subtitle,
   children,
   onClose,
   wide = false,
 }: {
   title: string;
+  focusKey: string;
   subtitle?: string;
   children: React.ReactNode;
   onClose: () => void;
   wide?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
     const previous = document.activeElement as HTMLElement;
     const focusable = () =>
       Array.from(
         ref.current?.querySelectorAll<HTMLElement>(
-          'button,input,select,textarea,a[href],[tabindex="0"]',
+          'a[href],area[href],button,input,select,textarea,summary,[tabindex],[contenteditable]:not([contenteditable="false"])',
         ) || [],
-      ).filter((e) => !(e as HTMLButtonElement).disabled);
-    focusable()[0]?.focus();
+      ).filter((element) => {
+        const style = window.getComputedStyle(element);
+        return (
+          !element.hasAttribute("hidden") &&
+          !element.matches(":disabled") &&
+          element.tabIndex >= 0 &&
+          style.visibility !== "hidden" &&
+          style.display !== "none" &&
+          element.getClientRects().length > 0
+        );
+      });
     const listener = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-      if (e.key === "Tab") {
-        const els = focusable(),
-          first = els[0],
-          last = els.at(-1);
-        if (e.shiftKey && document.activeElement === first) {
-          e.preventDefault();
-          last?.focus();
-        } else if (!e.shiftKey && document.activeElement === last) {
-          e.preventDefault();
-          first?.focus();
-        }
+      if (e.key === "Escape") onCloseRef.current();
+      if (e.key !== "Tab") return;
+      const elements = focusable(),
+        first = elements[0],
+        last = elements.at(-1),
+        activeIndex = elements.indexOf(document.activeElement as HTMLElement);
+      if (!first || !last) {
+        e.preventDefault();
+        ref.current?.focus();
+      } else if (e.shiftKey && activeIndex <= 0) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && (activeIndex < 0 || activeIndex === elements.length - 1)) {
+        e.preventDefault();
+        first.focus();
       }
     };
     document.addEventListener("keydown", listener);
@@ -216,6 +235,9 @@ function Modal({
       previous?.focus();
     };
   }, []);
+  useEffect(() => {
+    ref.current?.focus();
+  }, [focusKey]);
   return (
     <div
       className="modal-backdrop"
@@ -228,6 +250,7 @@ function Modal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="dialog-title"
+        tabIndex={-1}
         ref={ref}
       >
         <div className="modal-heading">
@@ -342,7 +365,7 @@ function App() {
       setServices(d.services);
       setFatal("");
     } catch (e) {
-      if ((e as Error).message.includes("sign in")) setState(null);
+      if ((e as Error & { status?: number }).status === 401) setState(null);
       else setFatal((e as Error).message);
     } finally {
       setLoading(false);
@@ -354,10 +377,7 @@ function App() {
   const open = (name: string) => {
     setError("");
     setModal(name);
-    if (name === "history")
-      api("/history")
-        .then(() => load())
-        .catch((e) => setError(e.message));
+    if (name === "history") load();
   };
   const close = () => {
     setModal("");
@@ -378,6 +398,12 @@ function App() {
       if (success) notify(success);
       return d;
     } catch (e) {
+      if ((e as Error & { status?: number }).status === 401) {
+        setState(null);
+        setFatal("");
+        close();
+        throw e;
+      }
       setError((e as Error).message);
       throw e;
     } finally {
@@ -1709,6 +1735,7 @@ function App() {
       )}
       {modal && (
         <Modal
+          focusKey={modal}
           title={
             {
               record: record ? "Edit health record" : "Add a health record",
@@ -2203,10 +2230,12 @@ function FormActions({
   busy,
   onCancel,
   label,
+  busyLabel,
 }: {
   busy: boolean;
   onCancel: () => void;
   label: string;
+  busyLabel?: string;
 }) {
   return (
     <div className="modal-actions">
@@ -2214,7 +2243,7 @@ function FormActions({
         Cancel
       </button>
       <button className="primary" disabled={busy} type="submit">
-        {busy ? "Saving…" : label}
+        {busy ? (busyLabel || "Saving…") : label}
         {!busy && <Check size={16} />}
       </button>
     </div>
@@ -2232,11 +2261,16 @@ function RecordForm({
   busy: boolean;
 }) {
   const [file, setFile] = useState(record?.file || null),
-    [fileError, setFileError] = useState("");
+    [fileError, setFileError] = useState(""),
+    [reading, setReading] = useState(false);
+  const readerRef = useRef<FileReader | null>(null),
+    readId = useRef(0);
+  useEffect(() => () => readerRef.current?.abort(), []);
   return (
     <form
       onSubmit={(e) => {
         e.preventDefault();
+        if (reading) return;
         onSave({ ...Object.fromEntries(new FormData(e.currentTarget)), file });
       }}
     >
@@ -2295,6 +2329,10 @@ function RecordForm({
             type="file"
             accept="application/pdf,image/png,image/jpeg"
             onChange={(e) => {
+              const currentRead = ++readId.current;
+              readerRef.current?.abort();
+              readerRef.current = null;
+              setReading(false);
               const f = e.target.files?.[0];
               if (!f) return;
               if (
@@ -2306,9 +2344,23 @@ function RecordForm({
                 return;
               }
               setFileError("");
+              setFile(null);
+              setReading(true);
               const reader = new FileReader();
-              reader.onload = () =>
+              readerRef.current = reader;
+              reader.onload = () => {
+                if (currentRead !== readId.current) return;
                 setFile({ name: f.name, data: String(reader.result) });
+                setReading(false);
+              };
+              reader.onerror = () => {
+                if (currentRead !== readId.current) return;
+                setFile(null);
+                setFileError(
+                  "The attachment could not be read. Please choose another file.",
+                );
+                setReading(false);
+              };
               reader.readAsDataURL(f);
             }}
           />
@@ -2330,7 +2382,8 @@ function RecordForm({
         {fileError && <p className="form-error span-2">{fileError}</p>}
       </div>
       <FormActions
-        busy={busy}
+        busy={busy || reading}
+        busyLabel={reading ? "Reading file…" : undefined}
         onCancel={onCancel}
         label={record ? "Save changes" : "Add record"}
       />
@@ -2855,6 +2908,7 @@ function SharedView({ token }: { token: string }) {
       {editing && (
         <Modal
           title="Edit shared record notes"
+          focusKey="shared-record-edit"
           onClose={() => setEditing(null)}
         >
           <form

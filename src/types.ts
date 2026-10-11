@@ -2,6 +2,7 @@ export type RecordType =
   "Lab result" | "Visit summary" | "Prescription" | "Imaging" | "Allergy";
 export type HealthRecord = {
   id: string;
+  externalId?: string;
   title: string;
   type: RecordType;
   date: string;
@@ -59,5 +60,6 @@ export type State = {
   history: Entry[];
   logs: Log[];
   settings: { social: boolean };
+  connections: unknown[];
   passkeys: { id: string; name: string }[];
 };
