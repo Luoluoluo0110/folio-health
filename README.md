@@ -62,6 +62,8 @@ A link’s recipient label identifies the intended reader, not a verified clinic
 
 Runtime data is created in `data/` (or `DATA_DIR`). Health state, revisions, and logs are encrypted using AES-256-GCM. Passwords use scrypt with individual salts. Session tokens and sharing tokens are stored as hashes. Cookies are HttpOnly and SameSite Strict, with Secure enabled for HTTPS origins; sessions expire after eight hours.
 
+Opening the personal workspace or revision history is a read-only operation and does not add an access-log entry. Sign-in, sign-out, exports, shared-link activity, and changes remain recorded.
+
 The local encryption key is stored in `data/encryption.key`. The host’s file permissions remain the security boundary: an attacker with access to both the database and key can decrypt the records. Account email addresses and authentication metadata are not encrypted in this starter.
 
 For a reliable backup, stop the server and copy the **entire data directory**, including `encryption.key`, `folio.sqlite`, and any WAL/SHM files that remain, to a private backup location. Restore that directory while the server is stopped. Losing the encryption key makes the health records unrecoverable. Never replace an existing data directory without first backing it up.
