@@ -206,15 +206,30 @@ app.post("/api/auth/login", (req, res) => {
   );
   if (!u || !timingSafeEqual(candidate, Buffer.from(u.password, "hex"))) {
     if (u) {
+      // An unsuccessful attempt is worth showing the owner, but recording every attempt
+      // would let anyone force a decrypt-and-rewrite of the account's encrypted state on
+      // demand. Record at most one per IP per hour, which bounds the write and still
+      // leaves a visible signal.
       const state = decrypt(u.state);
-      audit(
-        state,
-        "Denied",
-        "Unsuccessful password sign-in",
-        "Unverified visitor",
-        req.ip,
+      const hourAgo = Date.now() - 3600000;
+      const alreadyRecorded = state.logs.some(
+        (l) =>
+          l.action === "Denied" &&
+          l.location === req.ip &&
+          Date.parse(l.timestamp) > hourAgo,
       );
-      save(u.id, state);
+      if (alreadyRecorded) {
+        console.warn(`Denied sign-in for ${u.email} from ${req.ip} (already logged)`);
+      } else {
+        audit(
+          state,
+          "Denied",
+          "Unsuccessful password sign-in",
+          "Unverified visitor",
+          req.ip,
+        );
+        save(u.id, state);
+      }
     }
     return fail(res, "Email or password is incorrect.", 401);
   }
@@ -232,14 +247,8 @@ app.post("/api/logout", auth, (req, res) => {
   res.json({ ok: true });
 });
 app.get("/api/state", auth, (req, res) => {
-  audit(
-    req.state,
-    "Viewed",
-    "Health workspace and record index",
-    "You",
-    req.ip,
-  );
-  save(req.user.id, req.state);
+  // A plain read: no audit entry and no re-encrypt of the whole state, so simply
+  // loading the workspace does not grow or rewrite it.
   res.json({
     state: safeState(req.state),
     demo: !!req.user.demo,
@@ -620,8 +629,7 @@ app.get("/api/export", auth, (req, res) => {
   });
 });
 app.get("/api/history", auth, (req, res) => {
-  audit(req.state, "Viewed", "Revision history", "You", req.ip);
-  save(req.user.id, req.state);
+  // Also a plain read: the revision list is returned without recording or rewriting.
   res.json(req.state.history);
 });
 app.put("/api/settings", auth, (req, res) => {

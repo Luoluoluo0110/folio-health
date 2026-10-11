@@ -8,6 +8,8 @@ import {
   fuzzyMatch,
   importFHIR,
   fhirEntryDate,
+  audit,
+  maxLogEntries,
 } from "../server/model.mjs";
 test("new accounts are empty and do not inherit another person’s history", () => {
   const s = initialState(false, "Taylor");
@@ -182,4 +184,19 @@ test("FHIR entries only fail to import when they cannot become a record", () => 
   );
   assert.equal(fhirEntryDate({ resourceType: "Patient", id: "p" }), null);
   assert.equal(fhirEntryDate(null), null);
+});
+test("the access log is bounded and keeps the newest entries", () => {
+  const s = initialState(false, "Taylor");
+  const overflow = 25;
+  for (let i = 0; i < maxLogEntries + overflow; i++)
+    audit(s, "Viewed", `entry ${i}`, "You", "127.0.0.1");
+  assert.equal(s.logs.length, maxLogEntries, "the log must not grow past the cap");
+  assert.equal(s.logs[0].detail, `entry ${maxLogEntries + overflow - 1}`, "newest first");
+  assert.equal(s.logs.at(-1).detail, `entry ${overflow}`, "the oldest entries are dropped");
+  // an entry carries who did what, where, and when
+  assert.deepEqual(
+    Object.keys(s.logs[0]).sort(),
+    ["action", "actor", "detail", "id", "location", "timestamp"],
+  );
+  assert.ok(!Number.isNaN(Date.parse(s.logs[0].timestamp)));
 });

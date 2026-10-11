@@ -354,6 +354,49 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
   const wal = readFileSync(path.join(dir, "folio.sqlite-wal"));
   assert.ok(!dataFile.includes(Buffer.from("PRIVATE-LAB-TEXT")));
   assert.ok(!wal.includes(Buffer.from("PRIVATE-LAB-TEXT")));
+
+  // Access-log hygiene: reading the workspace is not an auditable event and must not
+  // rewrite the account state either.
+  const logsBeforeReads = (await call("/state", { cookie })).data.state.logs.length;
+  for (let i = 0; i < 5; i++) await call("/state", { cookie });
+  await call("/history", { cookie });
+  const afterReads = (await call("/state", { cookie })).data.state;
+  assert.equal(afterReads.logs.length, logsBeforeReads, "page loads must not grow the log");
+  assert.ok(
+    !afterReads.logs.some(
+      (l) => l.detail === "Health workspace and record index",
+    ),
+    "loading the workspace is no longer recorded",
+  );
+
+  // A failed sign-in is still shown to the owner, but repeating it must not force
+  // another decrypt-and-rewrite of their encrypted state on demand.
+  const denials = async () =>
+    (await call("/state", { cookie })).data.state.logs.filter(
+      (l) => l.action === "Denied",
+    ).length;
+  const denialsBefore = await denials();
+  const attempts = [];
+  for (let i = 0; i < 3; i++)
+    attempts.push(
+      (
+        await call("/auth/login", {
+          body: { email: "owner@test.example", password: "wrong-again" },
+        })
+      ).status,
+    );
+  assert.deepEqual(
+    attempts,
+    [401, 401, 401],
+    "the attempts must reach the handler rather than the auth rate limiter",
+  );
+  assert.ok(denialsBefore >= 1, "the first failed sign-in is recorded for the owner");
+  assert.equal(
+    await denials(),
+    denialsBefore,
+    "repeating a failed sign-in must not keep writing to the account state",
+  );
+
   await call("/logout", { cookie, body: {} });
   assert.equal((await call("/state", { cookie })).status, 401);
   const again = await call("/auth/login", {
