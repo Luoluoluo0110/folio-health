@@ -139,11 +139,14 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
     profileChange.data.state.history[0].snapshot.name,
     "Updated owner",
   );
-  assert.equal(
-    (await call("/records", { cookie, body: { ...lab, date: "2026-02-31" } }))
-      .status,
-    400,
-  );
+  const badDate = await call("/records", {
+    cookie,
+    body: { ...lab, date: "2026-02-31" },
+  });
+  assert.equal(badDate.status, 400);
+  // A caller-fixable failure must keep its own message and its 4xx status: the error
+  // middleware is only meant to absorb unexpected faults.
+  assert.match(badDate.data.error, /valid date/);
   r = await call("/records", {
     cookie,
     body: { ...lab, title: "Locked allergy", type: "Allergy" },
@@ -354,6 +357,44 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
   const wal = readFileSync(path.join(dir, "folio.sqlite-wal"));
   assert.ok(!dataFile.includes(Buffer.from("PRIVATE-LAB-TEXT")));
   assert.ok(!wal.includes(Buffer.from("PRIVATE-LAB-TEXT")));
+
+  // Error semantics: the caller's mistakes stay 4xx with an explanation, and internal
+  // error text never reaches the client.
+  const badBundle = await call("/import", {
+    cookie,
+    body: { resourceType: "Patient" },
+  });
+  assert.equal(badBundle.status, 400);
+  assert.match(badBundle.data.error, /FHIR Bundle/);
+  const badAttachment = await call("/records", {
+    cookie,
+    body: { ...lab, file: { name: "x.txt", data: "data:text/plain;base64,QQ==" } },
+  });
+  assert.equal(badAttachment.status, 400);
+  assert.match(badAttachment.data.error, /PDF, PNG, or JPEG/);
+  const malformedJson = await fetch(`${base}/api/import`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: "{ this is not json",
+  });
+  assert.equal(malformedJson.status, 400);
+  // A non-string profile name used to throw a TypeError inside the handler. Whether
+  // that is answered as a 400 or as an unexpected fault, the raw message must not leak.
+  const internal = await call("/profile", {
+    cookie,
+    method: "PUT",
+    body: { name: 123 },
+  });
+  assert.ok(
+    internal.status === 400 || internal.status >= 500,
+    `unexpected status ${internal.status}`,
+  );
+  assert.doesNotMatch(
+    internal.data.error,
+    /is not a function|Cannot read|TypeError|at Object\./,
+    "internal error text leaked to the client",
+  );
+
   await call("/logout", { cookie, body: {} });
   assert.equal((await call("/state", { cookie })).status, 401);
   const again = await call("/auth/login", {

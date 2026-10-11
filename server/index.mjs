@@ -128,6 +128,9 @@ const changed = (req, res, action, detail, extra = {}) => {
 };
 const fail = (res, message, status = 400) =>
   res.status(status).json({ error: message });
+// A failure the caller can fix. Marked with a status so the error middleware answers
+// 4xx with this message instead of reporting it as an unexpected server fault.
+const invalid = (message) => Object.assign(new Error(message), { status: 400 });
 const rate = new Map();
 app.use("/api/auth", (req, res, next) => {
   const k = req.ip,
@@ -293,7 +296,7 @@ function recordInput(body) {
     typeof body.notes !== "string" ||
     body.notes.length > 20000
   )
-    throw new Error(
+    throw invalid(
       "Please enter a title, record type, valid date, and notes under 20,000 characters.",
     );
   if (
@@ -303,7 +306,7 @@ function recordInput(body) {
     ) ||
       body.file.data.length > 7500000)
   )
-    throw new Error("Attach a PDF, PNG, or JPEG up to 5 MB.");
+    throw invalid("Attach a PDF, PNG, or JPEG up to 5 MB.");
   return {
     title: body.title.trim(),
     type: body.type,
@@ -535,9 +538,17 @@ app.put("/api/shared/:token/records/:id", share, (req, res) => {
   res.json({ ok: true });
 });
 function doImport(req, res, bundle) {
+  let incoming;
+  try {
+    incoming = importFHIR(bundle);
+  } catch (e) {
+    // A bundle the caller can fix, so this is their mistake rather than a fault of
+    // ours: answer 400 with the explanation instead of letting it reach the error
+    // middleware, which would treat an unmarked error as an internal failure.
+    return fail(res, e.message, 400);
+  }
   req.state = load(req.user.id).state;
-  const incoming = importFHIR(bundle),
-    known = new Set(req.state.records.map((r) => r.externalId).filter(Boolean)),
+  const known = new Set(req.state.records.map((r) => r.externalId).filter(Boolean)),
     fresh = incoming.filter((r) => {
       if (known.has(r.externalId)) return false;
       known.add(r.externalId);
@@ -794,12 +805,19 @@ app.post("/api/auth/sms/verify", async (req, res) => {
 });
 app.use("/api", (req, res) => fail(res, "Endpoint not found.", 404));
 app.use((err, req, res, next) => {
-  console.error(err.message);
-  res.status(err.status === 413 ? 413 : 400).json({
+  // express.json() and the marked validation errors carry a status. Anything else is
+  // an unexpected fault: report it as 5xx with a generic message rather than dressing
+  // it up as a client mistake and handing the caller our internal error text.
+  const status = err.status || err.statusCode || 500;
+  if (status >= 500) console.error(err.stack || err);
+  else console.error(`${status}: ${err.message}`);
+  res.status(status).json({
     error:
-      err.status === 413
+      status === 413
         ? "This file is too large."
-        : err.message || "The request could not be completed.",
+        : status >= 500
+          ? "The request could not be completed."
+          : err.message || "The request could not be completed.",
   });
 });
 if (process.argv.includes("--production")) {
