@@ -20,6 +20,7 @@ import {
   id,
   hash,
   types,
+  fhirEntryDate,
   initialState,
   audit,
   grantActive,
@@ -63,8 +64,8 @@ app.use((req, res, next) => {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "X-Frame-Options": "DENY",
-    "Cache-Control": "no-store",
   });
+  if (req.path.startsWith("/api/")) res.set("Cache-Control", "no-store");
   if (
     req.path.startsWith("/api/") &&
     !["GET", "HEAD"].includes(req.method) &&
@@ -641,8 +642,15 @@ app.post("/api/metrics", auth, (req, res) => {
   changed(req, res, "Added", "Health measurements", {}, ["metrics"]);
 });
 app.put("/api/targets", auth, (req, res) => {
+  const source = req.body,
+    targets = {};
+  if (!source || typeof source !== "object" || Array.isArray(source))
+    return fail(
+      res,
+      "Each upper limit must be greater than its lower limit.",
+    );
   for (const k of ["systolic", "glucose", "heartRate"]) {
-    const r = req.body[k];
+    const r = source[k];
     if (
       !r ||
       !Number.isFinite(+r.min) ||
@@ -654,8 +662,9 @@ app.put("/api/targets", auth, (req, res) => {
         res,
         "Each upper limit must be greater than its lower limit.",
       );
+    targets[k] = { min: +r.min, max: +r.max };
   }
-  req.state.targets = req.body;
+  req.state.targets = targets;
   changed(req, res, "Edited", "Personal reference ranges", {}, ["targets"]);
 });
 app.post("/api/grants", auth, (req, res) => {
@@ -669,8 +678,8 @@ app.post("/api/grants", auth, (req, res) => {
     !validDate(b.from) ||
     !validDate(b.to) ||
     b.from > b.to ||
-    !Number.isFinite(+b.days) ||
-    +b.days <= 0 ||
+    !Number.isInteger(+b.days) ||
+    +b.days < 1 ||
     +b.days > 90
   )
     return fail(
@@ -816,7 +825,11 @@ function doImport(req, res, bundle) {
       if (known.has(r.externalId)) return false;
       known.add(r.externalId);
       return true;
-    });
+    }),
+    // importFHIR() has already rejected anything that is not a Bundle with an
+    // entry array, so every entry here was either mapped or dropped. Counting the
+    // dropped ones covers both unhandled resource types and unusable dates.
+    skipped = bundle.entry.filter(({ resource: r }) => !fhirEntryDate(r)).length;
   req.state.records.push(...fresh);
   for (const r of fresh)
     addHistory(req.state, {
@@ -828,6 +841,7 @@ function doImport(req, res, bundle) {
     }, r.id);
   changed(req, res, "Imported", `${fresh.length} hospital records`, {
     count: fresh.length,
+    skipped,
   }, ["records", "history"], fresh);
 }
 app.post("/api/import", auth, (req, res) => doImport(req, res, req.body));
@@ -1084,7 +1098,14 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "The request could not be completed." });
 });
 if (process.argv.includes("--production")) {
-  app.use(express.static(path.join(root, "dist")));
+  app.use(
+    "/assets",
+    express.static(path.join(root, "dist/assets"), {
+      immutable: true,
+      maxAge: "1y",
+    }),
+  );
+  app.use(express.static(path.join(root, "dist"), { maxAge: 0 }));
   app.get("/{*splat}", (req, res) =>
     res.sendFile(path.join(root, "dist/index.html")),
   );

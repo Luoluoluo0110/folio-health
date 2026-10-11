@@ -65,10 +65,14 @@ textarea {
     transform 0.18s;
 }
 button:focus-visible,
-a:focus-visible {
-  outline: 3px solid #86b5a3;
-  outline-offset: 4px;
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 3px solid var(--teal, #245e53);
+  outline-offset: 2px;
 }
+
 button:hover:not(:disabled) {
   filter: brightness(0.98);
 }
@@ -117,8 +121,15 @@ textarea {
 input:focus,
 select:focus,
 textarea:focus {
-  border-color: #71998a;
-  box-shadow: 0 0 0 3px #eaf2ec;
+  outline: none;
+  border-color: var(--teal, #245e53);
+}
+
+input:focus:not(:focus-visible),
+select:focus:not(:focus-visible),
+textarea:focus:not(:focus-visible) {
+  outline: none;
+  box-shadow: none;
 }
 input::placeholder,
 textarea::placeholder {
@@ -2505,6 +2516,60 @@ pre {
 .care-tip p {
   line-height: 1.8;
 }
+/* Component metrics. Keep this block above the media queries below: a media query
+   adds no specificity, so an unconditional rule placed after one wins at every
+   width and silently kills those breakpoints. */
+.sidebar {
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.sidebar-bottom {
+  padding-top: 24px;
+}
+.nav-item {
+  font-size: 12px;
+}
+.primary,
+.secondary {
+  font-size: 12px;
+}
+.panel-head h3 {
+  font-size: 14px;
+}
+.record-title strong {
+  font-size: 12px;
+}
+.record-title small {
+  font-size: 10px;
+}
+.records-table td {
+  font-size: 11px;
+}
+.records-table th {
+  font-size: 10px;
+}
+.metric-top {
+  font-size: 11px;
+}
+.metric-foot .status {
+  font-size: 10px;
+}
+.care-person strong {
+  font-size: 12px;
+}
+.care-person small {
+  font-size: 10px;
+}
+.panel-head p,
+.panel-description {
+  font-size: 11px;
+}
+.welcome-content p {
+  font-size: 12px;
+}
+.banner-link {
+  font-size: 11px;
+}
 @media (min-width: 1600px) {
   .main-shell main {
     padding-top: 42px;
@@ -2979,6 +3044,9 @@ pre {
   .welcome-content p {
     font-size: 10px;
   }
+  .banner-link {
+    font-size: 10px;
+  }
   .banner-label {
     font-size: 7px;
   }
@@ -3078,6 +3146,9 @@ pre {
   .panel-head h3 {
     font-size: 12px;
   }
+  .panel-head p {
+    font-size: 10px;
+  }
   .chart-tabs {
     margin: 0 18px;
     gap: 24px;
@@ -3115,7 +3186,7 @@ pre {
     font-size: 10px;
   }
   .record-title small {
-    font-size: 8px;
+    font-size: 9px;
   }
   .record-icon {
     width: 29px;
@@ -3125,10 +3196,10 @@ pre {
     width: 16px;
   }
   .records-table th {
-    font-size: 8px;
+    font-size: 9px;
   }
   .records-table td {
-    font-size: 9px;
+    font-size: 10px;
   }
   .tag {
     font-size: 8px;
@@ -3532,98 +3603,11 @@ pre {
     scroll-behavior: auto !important;
   }
 }
-.sidebar {
-  overflow-y: auto;
-  scrollbar-width: thin;
-}
-.sidebar-bottom {
-  padding-top: 24px;
-}
-.nav-item {
-  font-size: 12px;
-}
-.primary,
-.secondary {
-  font-size: 12px;
-}
-.panel-head h3 {
-  font-size: 14px;
-}
-.record-title strong {
-  font-size: 12px;
-}
-.record-title small {
-  font-size: 10px;
-}
-.records-table td {
-  font-size: 11px;
-}
-.records-table th {
-  font-size: 10px;
-}
-.metric-top {
-  font-size: 11px;
-}
-.metric-foot .status {
-  font-size: 10px;
-}
-.care-person strong {
-  font-size: 12px;
-}
-.care-person small {
-  font-size: 10px;
-}
-.panel-head p,
-.panel-description {
-  font-size: 11px;
-}
-.welcome-content p {
-  font-size: 12px;
-}
-.banner-link {
-  font-size: 11px;
-}
 @media (max-height: 800px) {
   .privacy-mini {
     display: none;
   }
   .sidebar-bottom {
     padding-top: 20px;
-  }
-}
-@media (max-width: 760px) {
-  .primary,
-  .secondary {
-    font-size: 10px;
-  }
-  .metric-top {
-    font-size: 8px;
-  }
-  .metric-foot .status {
-    font-size: 7px;
-  }
-  .record-title strong {
-    font-size: 10px;
-  }
-  .record-title small {
-    font-size: 9px;
-  }
-  .records-table td {
-    font-size: 10px;
-  }
-  .records-table th {
-    font-size: 9px;
-  }
-  .panel-head h3 {
-    font-size: 12px;
-  }
-  .panel-head p {
-    font-size: 10px;
-  }
-  .welcome-content p {
-    font-size: 10px;
-  }
-  .banner-link {
-    font-size: 10px;
   }
 }

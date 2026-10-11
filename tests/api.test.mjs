@@ -2,11 +2,26 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createCipheriv, randomBytes } from "node:crypto";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { once } from "node:events";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
+import { createServer } from "node:net";
 import path from "node:path";
 import os from "node:os";
-const port = 5187,
+async function availablePort() {
+  const server = createServer();
+  server.unref();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const { port } = server.address();
+  await new Promise((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+  return port;
+}
+const port = await availablePort(),
   base = `http://localhost:${port}`,
   dir = mkdtempSync(path.join(os.tmpdir(), "folio-test-"));
 const child = spawn(process.execPath, ["server/index.mjs", "--production"], {
@@ -30,7 +45,12 @@ const ready = new Promise((resolve, reject) => {
     }
   });
   child.on("exit", (code) => {
-    if (code) reject(new Error(output));
+    clearTimeout(timeout);
+    reject(new Error(output || `Server exited before startup (code ${code}).`));
+  });
+  child.on("error", (error) => {
+    clearTimeout(timeout);
+    reject(error);
   });
 });
 async function call(url, { cookie, body, method, origin } = {}) {
@@ -51,8 +71,18 @@ async function call(url, { cookie, body, method, origin } = {}) {
 }
 const getState = async (cookie) => (await call("/state", { cookie })).data.state;
 test("authenticated health workflows enforce isolation, locks, revocation, and persist history", async (t) => {
+  t.after(async () => {
+    try {
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = once(child, "exit");
+        child.kill();
+        await exited;
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   await ready;
-  t.after(() => child.kill());
   assert.equal((await call("/state")).status, 401);
   const a = await call("/auth/register", {
     body: {
@@ -191,6 +221,22 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
     ).status,
     400,
   );
+  const targets = await call("/targets", {
+    cookie,
+    method: "PUT",
+    body: {
+      systolic: { min: "100", max: "130" },
+      glucose: { min: "70", max: "100" },
+      heartRate: { min: "60", max: "100" },
+      ignored: "value",
+    },
+  });
+  assert.equal(targets.status, 200);
+  assert.deepEqual(targets.data.state.targets, {
+    systolic: { min: 100, max: 130 },
+    glucose: { min: 70, max: 100 },
+    heartRate: { min: 60, max: 100 },
+  });
   const b = await call("/auth/register", {
     body: {
       name: "Other owner",
@@ -397,21 +443,21 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
   );
   await call(`/grants/${grantId}/revoke`, { cookie, body: {} });
   assert.equal((await call(`/shared/${token}`)).status, 403);
-  const exp = await call("/grants", {
-    cookie,
-    body: {
-      recipient: "Expired",
-      email: "expired@test.example",
-      types: ["Lab result"],
-      from: "2026-09-01",
-      to: "2026-09-01",
-      days: 0.000000001,
-    },
-  });
-  assert.equal(
-    (await call(`/shared/${exp.data.url.split("/").at(-1)}`)).status,
-    403,
-  );
+  for (const days of [0, 0.5, 91]) {
+    const invalidDuration = await call("/grants", {
+      cookie,
+      body: {
+        recipient: "Invalid duration",
+        email: "invalid@test.example",
+        types: ["Lab result"],
+        from: "2026-09-01",
+        to: "2026-09-01",
+        days,
+      },
+    });
+    assert.equal(invalidDuration.status, 400);
+    assert.match(invalidDuration.data.error, /1–90 days/);
+  }
   const fhir = {
     resourceType: "Bundle",
     entry: [
@@ -449,6 +495,30 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
     ).length,
     1,
     "editing an imported record does not cause a duplicate import",
+  );
+  assert.equal(
+    (
+      await call("/import", {
+        cookie,
+        body: {
+          ...fhir,
+          entry: [
+            ...fhir.entry,
+            { resource: { resourceType: "Patient", id: "patient-1" } },
+            {
+              resource: {
+                resourceType: "Observation",
+                id: "unusable-date",
+                code: { text: "No usable date" },
+                effectiveDateTime: "09/01/2026",
+              },
+            },
+          ],
+        },
+      })
+    ).data.skipped,
+    2,
+    "the import response reports both unmapped types and unusable dates",
   );
   const archive = await call("/export", { cookie });
   assert.equal(archive.data.format, "folio-archive-v1");
