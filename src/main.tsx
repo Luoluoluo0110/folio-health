@@ -344,7 +344,8 @@ function App() {
     [toast, setToast] = useState(""),
     [busy, setBusy] = useState(false),
     [error, setError] = useState(""),
-    [shareUrl, setShareUrl] = useState("");
+    [shareUrl, setShareUrl] = useState(""),
+    [shareBusy, setShareBusy] = useState(false);
   const [services, setServices] = useState({ sms: false, hospital: false }),
     [activityQuery, setActivityQuery] = useState("");
   const importRef = useRef<HTMLInputElement>(null);
@@ -382,7 +383,6 @@ function App() {
   const close = () => {
     setModal("");
     setError("");
-    setShareUrl("");
   };
   const mutate = async (
     url: string,
@@ -409,6 +409,21 @@ function App() {
       throw e;
     } finally {
       setBusy(false);
+    }
+  };
+  const createGrant = async (body: unknown) => {
+    setShareBusy(true);
+    setError("");
+    try {
+      const d = await api("/grants", body);
+      if (d.state) setState(d.state);
+      else await load();
+      setShareUrl(d.url);
+      notify("Sharing link is ready. Open Grant access to copy it.");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setShareBusy(false);
     }
   };
   const go = (p: string) => {
@@ -1993,16 +2008,22 @@ function App() {
                   <Link2 size={16} />
                   Copy sharing link
                 </button>
+                <button
+                  className="secondary full"
+                  onClick={() => {
+                    setShareUrl("");
+                    close();
+                  }}
+                >
+                  Done
+                </button>
               </div>
             ) : (
               <GrantForm
-                busy={busy}
+                busy={shareBusy}
                 onCancel={close}
                 onSave={async (b) => {
-                  try {
-                    const d = await mutate("/grants", b);
-                    setShareUrl(d.url);
-                  } catch {}
+                  await createGrant(b);
                 }}
               />
             ))}
