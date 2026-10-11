@@ -9,7 +9,7 @@ export type HealthRecord = {
   provider: string;
   condition: string;
   notes: string;
-  file: { name: string; data: string } | null;
+  file: { id: string; name: string; type: string; size: number; url?: string } | null;
   version: number;
 };
 export type Metric = {
