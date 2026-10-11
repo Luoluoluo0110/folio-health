@@ -149,6 +149,10 @@ export function initialState(demo = false, name = "Your name") {
     passkeys: [],
   };
 }
+// The access log lives inside the encrypted state, so it is re-encrypted and rewritten
+// on every change and shipped in every response. Keep it a bounded ring buffer: the
+// oldest entries fall off rather than the log growing for the life of the account.
+export const maxLogEntries = 500;
 export function audit(
   state,
   action,
@@ -164,6 +168,7 @@ export function audit(
     detail,
     location,
   });
+  if (state.logs.length > maxLogEntries) state.logs.length = maxLogEntries;
 }
 export function grantActive(g, now = Date.now()) {
   return !g.revoked && Date.parse(g.expires) > now;
