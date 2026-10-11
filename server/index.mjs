@@ -27,6 +27,7 @@ import {
   scopedRecords,
   canEdit,
   importFHIR,
+  fhirImportWarnings,
 } from "./model.mjs";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dir = process.env.DATA_DIR || path.join(root, "data");
@@ -846,7 +847,8 @@ function doImport(req, res, bundle) {
     // importFHIR() has already rejected anything that is not a Bundle with an
     // entry array, so every entry here was either mapped or dropped. Counting the
     // dropped ones covers both unhandled resource types and unusable dates.
-    skipped = bundle.entry.filter(({ resource: r }) => !fhirEntryDate(r)).length;
+    skipped = bundle.entry.filter(({ resource: r }) => !fhirEntryDate(r)).length,
+    warnings = fhirImportWarnings(bundle);
   req.state.records.push(...fresh);
   for (const r of fresh)
     addHistory(req.state, {
@@ -859,6 +861,7 @@ function doImport(req, res, bundle) {
   changed(req, res, "Imported", `${fresh.length} hospital records`, {
     count: fresh.length,
     skipped,
+    warnings,
   }, ["records", "history"], fresh);
 }
 app.post("/api/import", auth, (req, res) => doImport(req, res, req.body));
