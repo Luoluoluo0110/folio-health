@@ -16,6 +16,7 @@ test("new accounts are empty and do not inherit another person’s history", () 
   assert.equal(s.metrics.length, 0);
   assert.equal(s.grants.length, 0);
   assert.equal(s.settings.social, false);
+  assert.deepEqual(s.connections, []);
 });
 test("fuzzy record search tolerates an edit but preserves multiword matching", () => {
   assert.ok(fuzzyMatch("Annual health checkup Lab result", "chekup"));
@@ -56,6 +57,10 @@ test("allergy locks override note-edit permission", () => {
   assert.ok(!canEdit(g, { type: "Allergy" }));
   assert.ok(canEdit(g, { type: "Lab result" }));
   assert.ok(!canEdit({ ...g, editable: false }, { type: "Lab result" }));
+  assert.strictEqual(
+    canEdit({ ...g, editable: undefined }, { type: "Lab result" }),
+    false,
+  );
 });
 test("FHIR imports classify reports, preserve stable IDs and reject other formats", () => {
   const records = importFHIR({

@@ -179,7 +179,7 @@ export function scopedRecords(state, grant) {
 export function canEdit(grant, record) {
   return (
     grantActive(grant) &&
-    grant.editable &&
+    Boolean(grant.editable) &&
     !(grant.lockAllergies && record.type === "Allergy")
   );
 }
