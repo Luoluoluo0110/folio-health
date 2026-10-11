@@ -149,6 +149,10 @@ export function initialState(demo = false, name = "Your name") {
     passkeys: [],
   };
 }
+// The access log lives inside the encrypted state, so it is re-encrypted and rewritten
+// on every change and shipped in every response. Keep it a bounded ring buffer: the
+// oldest entries fall off rather than the log growing for the life of the account.
+export const maxLogEntries = 500;
 export function audit(
   state,
   action,
@@ -164,6 +168,7 @@ export function audit(
     detail,
     location,
   });
+  if (state.logs.length > maxLogEntries) state.logs.length = maxLogEntries;
 }
 export function grantActive(g, now = Date.now()) {
   return !g.revoked && Date.parse(g.expires) > now;
@@ -179,7 +184,7 @@ export function scopedRecords(state, grant) {
 export function canEdit(grant, record) {
   return (
     grantActive(grant) &&
-    grant.editable &&
+    Boolean(grant.editable) &&
     !(grant.lockAllergies && record.type === "Allergy")
   );
 }
@@ -227,6 +232,45 @@ const observationValues = (x) =>
     x.valueBoolean === undefined ? "" : String(x.valueBoolean),
     x.valueInteger === undefined ? "" : String(x.valueInteger),
   ].filter(Boolean);
+const documentAttachmentContent = (attachment) => {
+  if (typeof attachment?.data === "string" && attachment.data) {
+    const contentType = attachment.contentType || "";
+    if (!contentType || /^(text\/|application\/(json|xml|xhtml\+xml))/.test(contentType)) {
+      const text = Buffer.from(attachment.data, "base64").toString("utf8").trim();
+      if (text && !text.includes("\u0000")) return text;
+    }
+    return "Attachment content was provided inline but is not readable as text.";
+  }
+  if (attachment?.url)
+    return `Attachment content was not imported because it is only available at a remote URL: ${attachment.url}`;
+  return "Attachment content was not available in the FHIR export.";
+};
+const documentReferenceParts = (resource) => {
+  const description = resource.description || "";
+  const attachments = (resource.content || []).map(({ attachment = {} }) => ({
+    title: attachment.title || "",
+    content: documentAttachmentContent(attachment),
+  }));
+  return {
+    description,
+    attachments,
+    title:
+      attachments.find((attachment) => attachment.title)?.title ||
+      description ||
+      codeText(resource.type) ||
+      "DocumentReference",
+  };
+};
+export function fhirImportWarnings(bundle) {
+  return (bundle?.entry || []).flatMap(({ resource: r }) => {
+    if (r?.resourceType !== "DocumentReference") return [];
+    return documentReferenceParts(r).attachments
+      .filter(({ content }) => content.startsWith("Attachment content was"))
+      .map(({ title, content }) =>
+        `${r.description || r.id || "DocumentReference"}${title ? ` (${title})` : ""}: ${content}`,
+      );
+  });
+}
 // The date an entry would import as, or null when the entry cannot become a
 // record at all. Import callers use this to report what was dropped, so a bundle
 // never loses entries without saying so. An entry with no usable date field falls
@@ -259,9 +303,14 @@ export function importFHIR(bundle) {
           ? "Allergy"
           : r.resourceType === "Encounter"
             ? "Visit summary"
+            : r.resourceType === "DocumentReference"
+              ? "Visit summary"
             : "Lab result";
+      const document =
+        r.resourceType === "DocumentReference" ? documentReferenceParts(r) : null;
     const title =
-      codeText(r.code) ||
+        document?.title ||
+        codeText(r.code) ||
       r.type?.text ||
       r.medicationCodeableConcept?.text ||
       r.description ||
@@ -278,6 +327,11 @@ export function importFHIR(bundle) {
         "Hospital import",
       condition: codeText(r.code),
       notes: [
+        document?.description,
+        ...(document?.attachments || []).flatMap(({ title, content }) => [
+          title,
+          content,
+        ]),
         r.conclusion,
         ...observationValues(r),
         ...(r.component || []).map((c) =>
