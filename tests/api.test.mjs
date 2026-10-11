@@ -2,11 +2,26 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createCipheriv, randomBytes } from "node:crypto";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { once } from "node:events";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
+import { createServer } from "node:net";
 import path from "node:path";
 import os from "node:os";
-const port = 5187,
+async function availablePort() {
+  const server = createServer();
+  server.unref();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const { port } = server.address();
+  await new Promise((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+  return port;
+}
+const port = await availablePort(),
   base = `http://localhost:${port}`,
   dir = mkdtempSync(path.join(os.tmpdir(), "folio-test-"));
 const child = spawn(process.execPath, ["server/index.mjs", "--production"], {
@@ -30,7 +45,12 @@ const ready = new Promise((resolve, reject) => {
     }
   });
   child.on("exit", (code) => {
-    if (code) reject(new Error(output));
+    clearTimeout(timeout);
+    reject(new Error(output || `Server exited before startup (code ${code}).`));
+  });
+  child.on("error", (error) => {
+    clearTimeout(timeout);
+    reject(error);
   });
 });
 async function call(url, { cookie, body, method, origin } = {}) {
@@ -51,8 +71,18 @@ async function call(url, { cookie, body, method, origin } = {}) {
 }
 const getState = async (cookie) => (await call("/state", { cookie })).data.state;
 test("authenticated health workflows enforce isolation, locks, revocation, and persist history", async (t) => {
+  t.after(async () => {
+    try {
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = once(child, "exit");
+        child.kill();
+        await exited;
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   await ready;
-  t.after(() => child.kill());
   assert.equal((await call("/state")).status, 401);
   const a = await call("/auth/register", {
     body: {
@@ -83,6 +113,44 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
     ).status,
     403,
   );
+  for (const name of [123, null, {}, []]) {
+    const invalidName = await call("/profile", {
+      cookie,
+      method: "PUT",
+      body: { name },
+    });
+    assert.equal(invalidName.status, 400);
+    assert.match(invalidName.data.error, /name/i);
+    assert.doesNotMatch(invalidName.data.error, /trim|TypeError|Cannot read/i);
+  }
+  for (const dob of [123, null, {}, "2026-02-31", "09/01/1990"]) {
+    const invalidDob = await call("/profile", {
+      cookie,
+      method: "PUT",
+      body: { dob },
+    });
+    assert.equal(invalidDob.status, 400);
+    assert.match(invalidDob.data.error, /date of birth/i);
+  }
+  assert.equal(
+    (await call("/profile", {
+      cookie,
+      method: "PUT",
+      body: { dob: "1990-09-01" },
+    })).status,
+    200,
+  );
+  const beforeInvalidProfileField = (await getState(cookie)).profile;
+  const invalidProfileField = await call("/profile", {
+    cookie,
+    method: "PUT",
+    body: { name: "Should not persist", allergies: { value: "invalid" } },
+  });
+  assert.equal(invalidProfileField.status, 400);
+  assert.match(invalidProfileField.data.error, /profile fields must be text/i);
+  const afterInvalidProfileField = (await getState(cookie)).profile;
+  assert.equal(afterInvalidProfileField.name, beforeInvalidProfileField.name);
+  assert.equal(afterInvalidProfileField.allergies, beforeInvalidProfileField.allergies);
   const lab = {
     title: "PRIVATE-LAB-TEXT",
     type: "Lab result",
@@ -117,11 +185,14 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
     profileHistory.data[0].snapshot.name,
     "Updated owner",
   );
-  assert.equal(
-    (await call("/records", { cookie, body: { ...lab, date: "2026-02-31" } }))
-      .status,
-    400,
-  );
+  const badDate = await call("/records", {
+    cookie,
+    body: { ...lab, date: "2026-02-31" },
+  });
+  assert.equal(badDate.status, 400);
+  // A caller-fixable failure must keep its own message and its 4xx status: the error
+  // middleware is only meant to absorb unexpected faults.
+  assert.match(badDate.data.error, /valid date/);
   r = await call("/records", {
     cookie,
     body: { ...lab, title: "Locked allergy", type: "Allergy" },
@@ -153,6 +224,22 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
     ).status,
     400,
   );
+  const targets = await call("/targets", {
+    cookie,
+    method: "PUT",
+    body: {
+      systolic: { min: "100", max: "130" },
+      glucose: { min: "70", max: "100" },
+      heartRate: { min: "60", max: "100" },
+      ignored: "value",
+    },
+  });
+  assert.equal(targets.status, 200);
+  assert.deepEqual((await getState(cookie)).targets, {
+    systolic: { min: 100, max: 130 },
+    glucose: { min: 70, max: 100 },
+    heartRate: { min: 60, max: 100 },
+  });
   const b = await call("/auth/register", {
     body: {
       name: "Other owner",
@@ -230,12 +317,12 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
     .get("owner@test.example").count;
   await call("/state", { cookie });
   await call("/history", { cookie });
-  assert.deepEqual(sectionRows(), beforeRead, "read auditing does not rewrite state sections");
+  assert.deepEqual(sectionRows(), beforeRead, "plain reads do not rewrite state sections");
   assert.equal(
     attachmentsDb
       .prepare("SELECT count(*) AS count FROM access_logs WHERE user_id=(SELECT id FROM users WHERE email=?)")
       .get("owner@test.example").count,
-    logsBeforeRead + 2,
+    logsBeforeRead,
   );
   const beforeTinyMutation = new Map(
     recordRows().map(({ record_id, value }) => [record_id, value]),
@@ -436,6 +523,38 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
     2,
     "the import response reports both unmapped types and unusable dates",
   );
+  const documentImport = await call("/import", {
+    cookie,
+    body: {
+      resourceType: "Bundle",
+      entry: [
+        {
+          resource: {
+            resourceType: "DocumentReference",
+            id: "remote-document",
+            description: "External discharge report",
+            date: "2026-09-03",
+            content: [
+              {
+                attachment: {
+                  title: "Remote PDF",
+                  url: "https://example.test/discharge.pdf",
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+  });
+  assert.equal(documentImport.data.count, 1);
+  assert.match(documentImport.data.warnings[0], /Remote PDF/);
+  assert.equal(
+    (await getState(cookie)).records.find(
+      (r) => r.externalId === "DocumentReference/remote-document",
+    ).type,
+    "Visit summary",
+  );
   const archive = await call("/export", { cookie });
   assert.equal(archive.data.format, "folio-archive-v1");
   assert.ok(
@@ -458,6 +577,86 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
   const wal = readFileSync(path.join(dir, "folio.sqlite-wal"));
   assert.ok(!dataFile.includes(Buffer.from("PRIVATE-LAB-TEXT")));
   assert.ok(!wal.includes(Buffer.from("PRIVATE-LAB-TEXT")));
+
+  // Access-log hygiene: reading the workspace is not an auditable event and must not
+  // rewrite the account state either.
+  const logsBeforeReads = (await call("/state", { cookie })).data.state.logs.length;
+  for (let i = 0; i < 5; i++) await call("/state", { cookie });
+  await call("/history", { cookie });
+  const afterReads = (await call("/state", { cookie })).data.state;
+  assert.equal(afterReads.logs.length, logsBeforeReads, "page loads must not grow the log");
+  assert.ok(
+    !afterReads.logs.some(
+      (l) => l.detail === "Health workspace and record index",
+    ),
+    "loading the workspace is no longer recorded",
+  );
+
+  // A failed sign-in is still shown to the owner, but repeating it must not force
+  // another decrypt-and-rewrite of their encrypted state on demand.
+  const denials = async () =>
+    (await call("/state", { cookie })).data.state.logs.filter(
+      (l) => l.action === "Denied",
+    ).length;
+  const denialsBefore = await denials();
+  const attempts = [];
+  for (let i = 0; i < 3; i++)
+    attempts.push(
+      (
+        await call("/auth/login", {
+          body: { email: "owner@test.example", password: "wrong-again" },
+        })
+      ).status,
+    );
+  assert.deepEqual(
+    attempts,
+    [401, 401, 401],
+    "the attempts must reach the handler rather than the auth rate limiter",
+  );
+  assert.ok(denialsBefore >= 1, "the first failed sign-in is recorded for the owner");
+  assert.equal(
+    await denials(),
+    denialsBefore,
+    "repeating a failed sign-in must not keep writing to the account state",
+  );
+
+  // Error semantics: the caller's mistakes stay 4xx with an explanation, and internal
+  // error text never reaches the client.
+  const badBundle = await call("/import", {
+    cookie,
+    body: { resourceType: "Patient" },
+  });
+  assert.equal(badBundle.status, 400);
+  assert.match(badBundle.data.error, /FHIR Bundle/);
+  const badAttachment = await call("/records", {
+    cookie,
+    body: { ...lab, file: { name: "x.txt", data: "data:text/plain;base64,QQ==" } },
+  });
+  assert.equal(badAttachment.status, 400);
+  assert.match(badAttachment.data.error, /PDF, PNG, or JPEG/);
+  const malformedImport = await fetch(`${base}/api/import`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: "{ this is not json",
+  });
+  assert.equal(malformedImport.status, 400);
+  // A non-string profile name used to throw a TypeError inside the handler. Whether
+  // that is answered as a 400 or as an unexpected fault, the raw message must not leak.
+  const internal = await call("/profile", {
+    cookie,
+    method: "PUT",
+    body: { name: 123 },
+  });
+  assert.ok(
+    internal.status === 400 || internal.status >= 500,
+    `unexpected status ${internal.status}`,
+  );
+  assert.doesNotMatch(
+    internal.data.error,
+    /is not a function|Cannot read|TypeError|at Object\./,
+    "internal error text leaked to the client",
+  );
+
   await call("/logout", { cookie, body: {} });
   assert.equal((await call("/state", { cookie })).status, 401);
   const again = await call("/auth/login", {
@@ -471,4 +670,37 @@ test("authenticated health workflows enforce isolation, locks, revocation, and p
   const persistedAgain = await call("/state", { cookie: again.cookie });
   assert.equal(persistedAgain.status, 200, JSON.stringify(persistedAgain.data));
   assert.ok(persistedAgain.data.state.records.length >= 3);
+
+  const malformedJson = await fetch(`${base}/api/profile`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: again.cookie,
+    },
+    body: "{",
+  });
+  assert.equal(malformedJson.status, 400);
+  const malformedBody = await malformedJson.json();
+  assert.equal(malformedBody.error, "Invalid JSON request body.");
+  assert.doesNotMatch(JSON.stringify(malformedBody), /JSON.*position|Unexpected token/i);
+
+  const brokenAccount = await call("/auth/register", {
+    body: {
+      name: "Broken state test",
+      email: "broken-state@test.example",
+      password: "test-password-at-least-12",
+    },
+  });
+  const brokenDb = new DatabaseSync(path.join(dir, "folio.sqlite"));
+  brokenDb
+    .prepare(
+      "UPDATE user_state_sections SET value='not-valid-ciphertext' WHERE user_id=(SELECT id FROM users WHERE email=?) AND section='profile'",
+    )
+    .run("broken-state@test.example");
+  brokenDb.close();
+  const internalFailure = await call("/state", { cookie: brokenAccount.cookie });
+  assert.equal(internalFailure.status, 500);
+  assert.equal(internalFailure.data.error, "The request could not be completed.");
+  assert.doesNotMatch(JSON.stringify(internalFailure.data), /initialization vector|ciphertext/i);
+  assert.match(output, /Invalid authentication tag length|Invalid initialization vector/);
 });

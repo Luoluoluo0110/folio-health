@@ -174,40 +174,56 @@ function fuzzy(value: string, query: string) {
 }
 function Modal({
   title,
+  focusKey,
   subtitle,
   children,
   onClose,
   wide = false,
 }: {
   title: string;
+  focusKey: string;
   subtitle?: string;
   children: React.ReactNode;
   onClose: () => void;
   wide?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
     const previous = document.activeElement as HTMLElement;
     const focusable = () =>
       Array.from(
         ref.current?.querySelectorAll<HTMLElement>(
-          'button,input,select,textarea,a[href],[tabindex="0"]',
+          'a[href],area[href],button,input,select,textarea,summary,[tabindex],[contenteditable]:not([contenteditable="false"])',
         ) || [],
-      ).filter((e) => !(e as HTMLButtonElement).disabled);
-    focusable()[0]?.focus();
+      ).filter((element) => {
+        const style = window.getComputedStyle(element);
+        return (
+          !element.hasAttribute("hidden") &&
+          !element.matches(":disabled") &&
+          element.tabIndex >= 0 &&
+          style.visibility !== "hidden" &&
+          style.display !== "none" &&
+          element.getClientRects().length > 0
+        );
+      });
     const listener = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-      if (e.key === "Tab") {
-        const els = focusable(),
-          first = els[0],
-          last = els.at(-1);
-        if (e.shiftKey && document.activeElement === first) {
-          e.preventDefault();
-          last?.focus();
-        } else if (!e.shiftKey && document.activeElement === last) {
-          e.preventDefault();
-          first?.focus();
-        }
+      if (e.key === "Escape") onCloseRef.current();
+      if (e.key !== "Tab") return;
+      const elements = focusable(),
+        first = elements[0],
+        last = elements.at(-1),
+        activeIndex = elements.indexOf(document.activeElement as HTMLElement);
+      if (!first || !last) {
+        e.preventDefault();
+        ref.current?.focus();
+      } else if (e.shiftKey && activeIndex <= 0) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && (activeIndex < 0 || activeIndex === elements.length - 1)) {
+        e.preventDefault();
+        first.focus();
       }
     };
     document.addEventListener("keydown", listener);
@@ -219,6 +235,9 @@ function Modal({
       previous?.focus();
     };
   }, []);
+  useEffect(() => {
+    ref.current?.focus();
+  }, [focusKey]);
   return (
     <div
       className="modal-backdrop"
@@ -231,6 +250,7 @@ function Modal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="dialog-title"
+        tabIndex={-1}
         ref={ref}
       >
         <div className="modal-heading">
@@ -357,10 +377,7 @@ function App() {
   const open = (name: string) => {
     setError("");
     setModal(name);
-    if (name === "history")
-      api("/history")
-        .then(() => load())
-        .catch((e) => setError(e.message));
+    if (name === "history") load();
   };
   const close = () => {
     setModal("");
@@ -431,7 +448,10 @@ function App() {
         throw new Error("Choose a FHIR JSON file smaller than 8 MB.");
       const data = JSON.parse(await file.text());
       const d = await mutate("/import", data);
-      notify(`${d.count} hospital records imported and organized.`);
+      const warning = d.warnings?.length
+        ? ` Attachment limits: ${d.warnings.join(" ")}`
+        : "";
+      notify(`${d.count} hospital records imported and organized.${warning}`);
       close();
     } catch (e) {
       setError((e as Error).message);
@@ -1717,6 +1737,7 @@ function App() {
       )}
       {modal && (
         <Modal
+          focusKey={modal}
           title={
             {
               record: record ? "Edit health record" : "Add a health record",
@@ -2816,7 +2837,9 @@ function SharedView({ token }: { token: string }) {
       records: HealthRecord[];
     } | null>(null),
     [error, setError] = useState(""),
-    [editing, setEditing] = useState<HealthRecord | null>(null);
+    [editing, setEditing] = useState<HealthRecord | null>(null),
+    [sharedBusy, setSharedBusy] = useState(false),
+    [editError, setEditError] = useState("");
   const load = () =>
     api(`/shared/${token}`)
       .then(setData)
@@ -2877,7 +2900,10 @@ function SharedView({ token }: { token: string }) {
                     !(data.grant.lockAllergies && r.type === "Allergy") && (
                       <button
                         className="text-button"
-                        onClick={() => setEditing(r)}
+                        onClick={() => {
+                          setEditError("");
+                          setEditing(r);
+                        }}
                       >
                         Edit notes <ArrowRight size={14} />
                       </button>
@@ -2896,11 +2922,18 @@ function SharedView({ token }: { token: string }) {
       {editing && (
         <Modal
           title="Edit shared record notes"
-          onClose={() => setEditing(null)}
+          focusKey="shared-record-edit"
+          onClose={() => {
+            setEditError("");
+            setEditing(null);
+          }}
         >
           <form
             onSubmit={async (e) => {
               e.preventDefault();
+              if (sharedBusy) return;
+              setSharedBusy(true);
+              setEditError("");
               try {
                 await api(
                   `/shared/${token}/records/${editing.id}`,
@@ -2910,21 +2943,32 @@ function SharedView({ token }: { token: string }) {
                 setEditing(null);
                 load();
               } catch (e) {
-                setError((e as Error).message);
+                setEditError((e as Error).message);
+              } finally {
+                setSharedBusy(false);
               }
             }}
           >
+            {editError && (
+              <div className="form-error" role="alert">
+                {editError}
+              </div>
+            )}
             <Field label="Notes">
               <textarea
                 name="notes"
                 defaultValue={editing.notes}
                 rows={8}
                 maxLength={20000}
+                disabled={sharedBusy}
               />
             </Field>
             <FormActions
-              busy={false}
-              onCancel={() => setEditing(null)}
+              busy={sharedBusy}
+              onCancel={() => {
+                setEditError("");
+                setEditing(null);
+              }}
               label="Save notes"
             />
           </form>

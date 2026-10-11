@@ -27,6 +27,7 @@ import {
   scopedRecords,
   canEdit,
   importFHIR,
+  fhirImportWarnings,
 } from "./model.mjs";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dir = process.env.DATA_DIR || path.join(root, "data");
@@ -322,7 +323,7 @@ const storeAttachment = (uid, file) => {
         .get(file.id, uid)
     : null;
   if (!existing)
-    throw new Error("Attachment is unavailable. Please upload it again.");
+    throw new ClientError("Attachment is unavailable. Please upload it again.");
   return { id: file.id, name: file.name, type: file.type, size: file.size };
 };
 const validateFile = (file) => {
@@ -332,10 +333,19 @@ const validateFile = (file) => {
       !/^data:(application\/pdf|image\/(png|jpeg));base64,/.test(file.data) ||
       file.data.length > 7500000)
   )
-    throw new Error("Attach a PDF, PNG, or JPEG up to 5 MB.");
+    throw new ClientError("Attach a PDF, PNG, or JPEG up to 5 MB.");
 };
+class ClientError extends Error {
+  constructor(message, status = 400) {
+    super(message);
+    this.status = status;
+  }
+}
 const fail = (res, message, status = 400) =>
   res.status(status).json({ error: message });
+// A failure the caller can fix. Marked with a status so the error middleware answers
+// 4xx with this message instead of reporting it as an unexpected server fault.
+const invalid = (message) => Object.assign(new Error(message), { status: 400 });
 const rate = new Map();
 app.use("/api/auth", (req, res, next) => {
   const k = req.ip,
@@ -427,15 +437,30 @@ app.post("/api/auth/login", (req, res) => {
   );
   if (!u || !timingSafeEqual(candidate, Buffer.from(u.password, "hex"))) {
     if (u) {
+      // An unsuccessful attempt is worth showing the owner, but recording every attempt
+      // would let anyone force a decrypt-and-rewrite of the account's encrypted state on
+      // demand. Record at most one per IP per hour, which bounds the write and still
+      // leaves a visible signal.
       const state = load(u.id).state;
-      recordAudit(
-        state,
-        u.id,
-        "Denied",
-        "Unsuccessful password sign-in",
-        "Unverified visitor",
-        req.ip,
+      const hourAgo = Date.now() - 3600000;
+      const alreadyRecorded = state.logs.some(
+        (l) =>
+          l.action === "Denied" &&
+          l.location === req.ip &&
+          Date.parse(l.timestamp) > hourAgo,
       );
+      if (alreadyRecorded) {
+        console.warn(`Denied sign-in for ${u.email} from ${req.ip} (already logged)`);
+      } else {
+        recordAudit(
+          state,
+          u.id,
+          "Denied",
+          "Unsuccessful password sign-in",
+          "Unverified visitor",
+          req.ip,
+        );
+      }
     }
     return fail(res, "Email or password is incorrect.", 401);
   }
@@ -451,14 +476,8 @@ app.post("/api/logout", auth, (req, res) => {
   res.json({ ok: true });
 });
 app.get("/api/state", auth, (req, res) => {
-  recordAudit(
-    req.state,
-    req.user.id,
-    "Viewed",
-    "Health workspace and record index",
-    "You",
-    req.ip,
-  );
+  // A plain read: no audit entry and no re-encrypt of the whole state, so simply
+  // loading the workspace does not grow or rewrite it.
   res.json({
     state: safeState(req.state),
     demo: !!req.user.demo,
@@ -479,14 +498,34 @@ app.get("/api/state", auth, (req, res) => {
 app.put("/api/profile", auth, (req, res) => {
   const p = req.body,
     before = structuredClone(req.state.profile);
-  if (p.name !== undefined && (!p.name.trim() || p.name.length > 100))
+  if (!p || typeof p !== "object" || Array.isArray(p))
+    return fail(res, "Submit profile fields as a JSON object.");
+  if (
+    p.name !== undefined &&
+    (typeof p.name !== "string" || !p.name.trim() || p.name.length > 100)
+  )
     return fail(res, "Enter a name under 100 characters.");
-  if (p.phone && !/^\+[1-9]\d{7,14}$/.test(p.phone))
+  if (
+    p.dob !== undefined &&
+    (typeof p.dob !== "string" || (p.dob !== "" && !validDate(p.dob)))
+  )
+    return fail(res, "Enter a valid date of birth in YYYY-MM-DD format.");
+  if (
+    p.phone !== undefined &&
+    (typeof p.phone !== "string" ||
+      (p.phone !== "" && !/^\+[1-9]\d{7,14}$/.test(p.phone)))
+  )
     return fail(res, "Use an international phone number, starting with +.");
   for (const k of Object.keys(req.state.profile)) {
+    if (["email", "name", "dob", "phone"].includes(k) || p[k] === undefined)
+      continue;
+    if (typeof p[k] !== "string" || p[k].length > 4000)
+      return fail(res, "Profile fields must be text under 4,000 characters.");
+  }
+  for (const k of Object.keys(req.state.profile)) {
     if (k === "email") continue;
-    if (typeof p[k] === "string" && p[k].length <= 4000)
-      req.state.profile[k] = p[k];
+    if (p[k] === undefined) continue;
+    req.state.profile[k] = p[k];
   }
   addHistory(req.state, {
     id: id(),
@@ -512,7 +551,7 @@ function recordInput(body) {
     typeof body.notes !== "string" ||
     body.notes.length > 20000
   )
-    throw new Error(
+    throw new ClientError(
       "Please enter a title, record type, valid date, and notes under 20,000 characters.",
     );
   validateFile(body.file?.data ? body.file : null);
@@ -616,8 +655,15 @@ app.post("/api/metrics", auth, (req, res) => {
   changed(req, res, "Added", "Health measurements", {}, ["metrics"]);
 });
 app.put("/api/targets", auth, (req, res) => {
+  const source = req.body,
+    targets = {};
+  if (!source || typeof source !== "object" || Array.isArray(source))
+    return fail(
+      res,
+      "Each upper limit must be greater than its lower limit.",
+    );
   for (const k of ["systolic", "glucose", "heartRate"]) {
-    const r = req.body[k];
+    const r = source[k];
     if (
       !r ||
       !Number.isFinite(+r.min) ||
@@ -629,8 +675,9 @@ app.put("/api/targets", auth, (req, res) => {
         res,
         "Each upper limit must be greater than its lower limit.",
       );
+    targets[k] = { min: +r.min, max: +r.max };
   }
-  req.state.targets = req.body;
+  req.state.targets = targets;
   changed(req, res, "Edited", "Personal reference ranges", {}, ["targets"]);
 });
 app.post("/api/grants", auth, (req, res) => {
@@ -782,9 +829,16 @@ app.put("/api/shared/:token/records/:id", share, (req, res) => {
   res.json({ ok: true });
 });
 function doImport(req, res, bundle) {
+  if (bundle?.resourceType !== "Bundle" || !Array.isArray(bundle.entry))
+    return fail(res, "Choose a FHIR Bundle JSON file.");
+  let incoming;
+  try {
+    incoming = importFHIR(bundle);
+  } catch (e) {
+    return fail(res, e.message, 400);
+  }
   req.state = load(req.user.id).state;
-  const incoming = importFHIR(bundle),
-    known = new Set(req.state.records.map((r) => r.externalId).filter(Boolean)),
+  const known = new Set(req.state.records.map((r) => r.externalId).filter(Boolean)),
     fresh = incoming.filter((r) => {
       if (known.has(r.externalId)) return false;
       known.add(r.externalId);
@@ -793,7 +847,8 @@ function doImport(req, res, bundle) {
     // importFHIR() has already rejected anything that is not a Bundle with an
     // entry array, so every entry here was either mapped or dropped. Counting the
     // dropped ones covers both unhandled resource types and unusable dates.
-    skipped = bundle.entry.filter(({ resource: r }) => !fhirEntryDate(r)).length;
+    skipped = bundle.entry.filter(({ resource: r }) => !fhirEntryDate(r)).length,
+    warnings = fhirImportWarnings(bundle);
   req.state.records.push(...fresh);
   for (const r of fresh)
     addHistory(req.state, {
@@ -806,6 +861,7 @@ function doImport(req, res, bundle) {
   changed(req, res, "Imported", `${fresh.length} hospital records`, {
     count: fresh.length,
     skipped,
+    warnings,
   }, ["records", "history"], fresh);
 }
 app.post("/api/import", auth, (req, res) => doImport(req, res, req.body));
@@ -877,7 +933,7 @@ app.get("/api/export", auth, (req, res) => {
   });
 });
 app.get("/api/history", auth, (req, res) => {
-  recordAudit(req.state, req.user.id, "Viewed", "Revision history", "You", req.ip);
+  // Also a plain read: the revision list is returned without recording or rewriting.
   res.json(req.state.history);
 });
 app.put("/api/settings", auth, (req, res) => {
@@ -1049,13 +1105,19 @@ app.post("/api/auth/sms/verify", async (req, res) => {
 });
 app.use("/api", (req, res) => fail(res, "Endpoint not found.", 404));
 app.use((err, req, res, next) => {
-  console.error(err.message);
-  res.status(err.status === 413 ? 413 : 400).json({
-    error:
-      err.status === 413
-        ? "This file is too large."
-        : err.message || "The request could not be completed.",
-  });
+  if (res.headersSent) return next(err);
+  if (err instanceof ClientError) {
+    console.error(`${err.status}: ${err.message}`);
+    return res.status(err.status).json({ error: err.message });
+  }
+  if (err.type === "entity.parse.failed")
+    return res.status(400).json({ error: "Invalid JSON request body." });
+  if (err.type === "entity.too.large")
+    return res.status(413).json({ error: "This request body is too large." });
+  if (err.type === "encoding.unsupported" || err.type === "charset.unsupported")
+    return res.status(415).json({ error: "This request encoding is not supported." });
+  console.error(err.stack || err);
+  res.status(500).json({ error: "The request could not be completed." });
 });
 if (process.argv.includes("--production")) {
   app.use(

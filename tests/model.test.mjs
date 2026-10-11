@@ -7,7 +7,10 @@ import {
   canEdit,
   fuzzyMatch,
   importFHIR,
+  fhirImportWarnings,
   fhirEntryDate,
+  audit,
+  maxLogEntries,
 } from "../server/model.mjs";
 test("new accounts are empty and do not inherit another person’s history", () => {
   const s = initialState(false, "Taylor");
@@ -16,6 +19,7 @@ test("new accounts are empty and do not inherit another person’s history", () 
   assert.equal(s.metrics.length, 0);
   assert.equal(s.grants.length, 0);
   assert.equal(s.settings.social, false);
+  assert.deepEqual(s.connections, []);
 });
 test("fuzzy record search tolerates an edit but preserves multiword matching", () => {
   assert.ok(fuzzyMatch("Annual health checkup Lab result", "chekup"));
@@ -56,6 +60,10 @@ test("allergy locks override note-edit permission", () => {
   assert.ok(!canEdit(g, { type: "Allergy" }));
   assert.ok(canEdit(g, { type: "Lab result" }));
   assert.ok(!canEdit({ ...g, editable: false }, { type: "Lab result" }));
+  assert.strictEqual(
+    canEdit({ ...g, editable: undefined }, { type: "Lab result" }),
+    false,
+  );
 });
 test("FHIR imports classify reports, preserve stable IDs and reject other formats", () => {
   const records = importFHIR({
@@ -151,6 +159,75 @@ test("FHIR imports keep quantity, string, coded and component observation values
     "Systolic: 120 mmHg\nDiastolic: 78 mmHg",
   );
 });
+test("DocumentReference imports preserve titles, descriptions and readable inline content", () => {
+  const records = importFHIR({
+    resourceType: "Bundle",
+    entry: [
+      {
+        resource: {
+          resourceType: "DocumentReference",
+          id: "document-1",
+          description: "Discharge summary",
+          date: "2026-09-01",
+          content: [
+            {
+              attachment: {
+                title: "Aftercare instructions",
+                contentType: "text/plain",
+                data: Buffer.from("Drink plenty of water.").toString("base64"),
+              },
+            },
+          ],
+        },
+      },
+    ],
+  });
+  assert.equal(records[0].type, "Visit summary");
+  assert.equal(records[0].title, "Aftercare instructions");
+  assert.match(records[0].notes, /Discharge summary/);
+  assert.match(records[0].notes, /Aftercare instructions/);
+  assert.match(records[0].notes, /Drink plenty of water\./);
+});
+test("DocumentReference reports attachments that cannot be imported", () => {
+  const bundle = {
+    resourceType: "Bundle",
+    entry: [
+      {
+        resource: {
+          resourceType: "DocumentReference",
+          id: "document-2",
+          description: "External report",
+          date: "2026-09-01",
+          content: [{ attachment: { title: "PDF report", url: "https://example.test/report.pdf" } }],
+        },
+      },
+    ],
+  };
+  const records = importFHIR(bundle);
+  assert.match(records[0].notes, /only available at a remote URL/);
+  assert.match(fhirImportWarnings(bundle)[0], /PDF report/);
+});
+test("DocumentReference keeps readable inline data when content type is omitted", () => {
+  const record = importFHIR({
+    resourceType: "Bundle",
+    entry: [
+      {
+        resource: {
+          resourceType: "DocumentReference",
+          date: "2026-09-01",
+          content: [
+            {
+              attachment: {
+                data: Buffer.from("Plain text from the export").toString("base64"),
+              },
+            },
+          ],
+        },
+      },
+    ],
+  })[0];
+  assert.match(record.notes, /Plain text from the export/);
+});
 test("FHIR entries only fail to import when they cannot become a record", () => {
   assert.equal(
     fhirEntryDate({
@@ -177,4 +254,19 @@ test("FHIR entries only fail to import when they cannot become a record", () => 
   );
   assert.equal(fhirEntryDate({ resourceType: "Patient", id: "p" }), null);
   assert.equal(fhirEntryDate(null), null);
+});
+test("the access log is bounded and keeps the newest entries", () => {
+  const s = initialState(false, "Taylor");
+  const overflow = 25;
+  for (let i = 0; i < maxLogEntries + overflow; i++)
+    audit(s, "Viewed", `entry ${i}`, "You", "127.0.0.1");
+  assert.equal(s.logs.length, maxLogEntries, "the log must not grow past the cap");
+  assert.equal(s.logs[0].detail, `entry ${maxLogEntries + overflow - 1}`, "newest first");
+  assert.equal(s.logs.at(-1).detail, `entry ${overflow}`, "the oldest entries are dropped");
+  // an entry carries who did what, where, and when
+  assert.deepEqual(
+    Object.keys(s.logs[0]).sort(),
+    ["action", "actor", "detail", "id", "location", "timestamp"],
+  );
+  assert.ok(!Number.isNaN(Date.parse(s.logs[0].timestamp)));
 });
