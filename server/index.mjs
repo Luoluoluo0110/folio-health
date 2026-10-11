@@ -342,6 +342,9 @@ class ClientError extends Error {
 }
 const fail = (res, message, status = 400) =>
   res.status(status).json({ error: message });
+// A failure the caller can fix. Marked with a status so the error middleware answers
+// 4xx with this message instead of reporting it as an unexpected server fault.
+const invalid = (message) => Object.assign(new Error(message), { status: 400 });
 const rate = new Map();
 app.use("/api/auth", (req, res, next) => {
   const k = req.ip,
@@ -818,9 +821,14 @@ app.put("/api/shared/:token/records/:id", share, (req, res) => {
 function doImport(req, res, bundle) {
   if (bundle?.resourceType !== "Bundle" || !Array.isArray(bundle.entry))
     return fail(res, "Choose a FHIR Bundle JSON file.");
+  let incoming;
+  try {
+    incoming = importFHIR(bundle);
+  } catch (e) {
+    return fail(res, e.message, 400);
+  }
   req.state = load(req.user.id).state;
-  const incoming = importFHIR(bundle),
-    known = new Set(req.state.records.map((r) => r.externalId).filter(Boolean)),
+  const known = new Set(req.state.records.map((r) => r.externalId).filter(Boolean)),
     fresh = incoming.filter((r) => {
       if (known.has(r.externalId)) return false;
       known.add(r.externalId);
@@ -1086,15 +1094,17 @@ app.post("/api/auth/sms/verify", async (req, res) => {
 app.use("/api", (req, res) => fail(res, "Endpoint not found.", 404));
 app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
-  if (err instanceof ClientError)
+  if (err instanceof ClientError) {
+    console.error(`${err.status}: ${err.message}`);
     return res.status(err.status).json({ error: err.message });
+  }
   if (err.type === "entity.parse.failed")
     return res.status(400).json({ error: "Invalid JSON request body." });
   if (err.type === "entity.too.large")
     return res.status(413).json({ error: "This request body is too large." });
   if (err.type === "encoding.unsupported" || err.type === "charset.unsupported")
     return res.status(415).json({ error: "This request encoding is not supported." });
-  console.error(err);
+  console.error(err.stack || err);
   res.status(500).json({ error: "The request could not be completed." });
 });
 if (process.argv.includes("--production")) {
