@@ -5,7 +5,6 @@ import {
   grantActive,
   scopedRecords,
   canEdit,
-  fuzzyMatch,
   importFHIR,
   fhirImportWarnings,
   fhirEntryDate,
@@ -20,13 +19,6 @@ test("new accounts are empty and do not inherit another person’s history", () 
   assert.equal(s.grants.length, 0);
   assert.equal(s.settings.social, false);
   assert.deepEqual(s.connections, []);
-});
-test("fuzzy record search tolerates an edit but preserves multiword matching", () => {
-  assert.ok(fuzzyMatch("Annual health checkup Lab result", "chekup"));
-  assert.ok(
-    fuzzyMatch("Lipid panel cholesterol screening", "lipid cholestrol"),
-  );
-  assert.ok(!fuzzyMatch("Lipid panel", "heart screening"));
 });
 test("sharing scope includes only authorized types and dates", () => {
   const s = {

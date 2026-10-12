@@ -188,35 +188,7 @@ export function canEdit(grant, record) {
     !(grant.lockAllergies && record.type === "Allergy")
   );
 }
-export function fuzzyMatch(value, query) {
-  const text = value.toLowerCase();
-  return query
-    .toLowerCase()
-    .trim()
-    .split(/\s+/)
-    .every((word) => {
-      if (text.includes(word)) return true;
-      return text.split(/\W+/).some((candidate) => {
-        if (Math.abs(candidate.length - word.length) > 1 || word.length < 4)
-          return false;
-        const d = Array.from({ length: word.length + 1 }, (_, i) => i);
-        for (let j = 1; j <= candidate.length; j++) {
-          let prev = d[0];
-          d[0] = j;
-          for (let i = 1; i <= word.length; i++) {
-            const old = d[i];
-            d[i] = Math.min(
-              d[i] + 1,
-              d[i - 1] + 1,
-              prev + (word[i - 1] === candidate[j - 1] ? 0 : 1),
-            );
-            prev = old;
-          }
-        }
-        return d[word.length] <= 1;
-      });
-    });
-}
+
 const codeText = (concept) =>
   concept?.text || concept?.coding?.find((c) => c.display)?.display || "";
 const quantityText = (q) =>
